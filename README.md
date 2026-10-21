@@ -531,6 +531,38 @@ always registered and cannot be toggled; it answers
 `set_passive_listeners` with the standard `Unknown command: ...`
 error, which the tool surfaces as its usual Error string.
 
+### Connection lifecycle and timeouts
+
+Every command exchange runs under a per-command socket budget,
+applied before the request is sent: 65 s for `create_audio_clip`,
+the sum of the per-item budgets for `execute_batch` (with a 15 s
+floor), 15 s for other state-modifying commands, 10 s for reads. Both receive paths (v1 and
+framing v2) honour the budget - before MCP-09 the v1 receive path
+silently overrode it with a hard 15 s, so long commands failed at
+15 s whatever budget they carried.
+
+Failures are classified by when they happen:
+
+- **Before the request is fully sent** (connect refused, a send
+  error): a plain exception, as before - the command was not
+  applied.
+- **After the request was fully sent but no complete response
+  arrived** (timeout, connection loss mid-response, an unparseable
+  response): `AbletonConnection.send_command` / `send_batch` raise
+  `OutcomeUnknownError` (`MCP_Server.server`). The command may have
+  been applied in Live - do not blindly retry; reconcile against
+  the session state first. For a batch the classification is at
+  batch granularity: the batch may have partially applied and the
+  per-item outcomes are unknowable.
+- **A definitive answer** (the script's `status: "error"` envelope,
+  a request-id echo mismatch): a plain exception carrying the
+  script's message, as before.
+
+Every failure path closes the socket and resets the per-connection
+state (including the framing-v2 adoption), so the next command
+reconnects and re-negotiates from v1 instead of inheriting a
+half-open connection.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
@@ -540,7 +572,9 @@ representative composite workflows against a fake TCP peer, a synthetic
 snapshot serialisation model, full vs projected snapshot sizes from
 the real serializer, and a browser browse-then-find scenario counting
 wire requests and hierarchy walks, plus a passive-listener census /
-event-queue scenario. Add `--json` for machine-readable output.
+event-queue scenario and a timeout-budget scenario replaying
+simulated response gaps against the per-command budgets. Add
+`--json` for machine-readable output.
 
 ## Limitations & Security Considerations
 
