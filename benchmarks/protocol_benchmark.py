@@ -28,6 +28,9 @@ before/after table produced by this script:
      plus eight set_device_parameter calls - 9 wire requests) beside
      MCP-06's (one subset read plus one set_device_parameters call -
      2 wire requests), reporting wire requests and result bytes.
+     B6 replays simulated response gaps against the per-command
+     timeout budgets (MCP-09): gaps beyond the old v1 receive path's
+     hard 15 s override, inside the budgets the commands carry.
 
   C. Snapshot serialisation model. Builds the audit's synthetic
      field-for-field snapshot shape (per track: 2 devices x 20
@@ -1306,6 +1309,119 @@ def bench_passive_listeners():
     return rows
 
 
+# --------------------------------------------------------------------------
+# B6. Timeout budgets vs simulated response gaps (MCP-09)
+# --------------------------------------------------------------------------
+
+class _GapSocket:
+    """Fake socket with a virtual response gap.
+
+    recv() raises socket.timeout when the scripted gap exceeds the
+    timeout in force - the contract a real socket offers - and serves
+    the payload (in small slices) otherwise. Nothing really waits:
+    the point is WHICH timeout value governs the exchange, not
+    wall-clock latency.
+    """
+
+    def __init__(self, payload, gap):
+        self._data = payload
+        self._i = 0
+        self._gap = gap
+        self._timeout = None
+        self._gap_done = False
+        self.sent = []
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self._timeout = timeout
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, _size):
+        if not self._gap_done:
+            self._gap_done = True
+            if self._timeout is not None and self._gap > self._timeout:
+                raise socket.timeout("timed out (simulated gap)")
+        if self._i >= len(self._data):
+            return b""
+        chunk = self._data[self._i:self._i + 5]
+        self._i += len(chunk)
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+def bench_timeout_budgets():
+    """B6 (MCP-09): do per-command budgets survive the receive paths?
+
+    Each live row runs a real AbletonConnection against a fake peer
+    whose response gap is simulated at 20 s (see _GapSocket) - beyond
+    the pre-MCP-09 v1 receive path's hard 15 s override, but within
+    create_audio_clip's 65 s budget and a two-item batch's summed
+    25 s. The legacy rows are definitional, like B5's: the old v1
+    receive forced settimeout(15.0), so any gap over 15 s timed out
+    whatever budget the command had selected. The read row pins the
+    other direction: a gap beyond a command's own budget fails, now
+    as OutcomeUnknownError instead of a plain timeout.
+    """
+    from MCP_Server.framing import encode_frame
+    from MCP_Server.server import AbletonConnection, OutcomeUnknownError
+
+    gap = 20.0
+    rows = []
+
+    def run(scenario, framing, budget, payload, framing_v2=False,
+            command=None, batch=None):
+        sock = _GapSocket(payload, gap)
+        conn = AbletonConnection("127.0.0.1", 9)
+        conn.sock = sock
+        conn._framing_v2 = framing_v2
+        try:
+            if batch is not None:
+                conn.send_batch(batch)
+            else:
+                conn.send_command(command)
+            outcome = "completed"
+        except OutcomeUnknownError:
+            outcome = "OutcomeUnknownError"
+        except Exception as e:  # pragma: no cover - defensive row fill
+            outcome = type(e).__name__
+        rows.append({"scenario": scenario, "framing": framing,
+                     "budget_s": budget, "simulated_gap_s": gap,
+                     "outcome": outcome})
+
+    ok_v1 = json.dumps({"status": "success", "result": {}}).encode("utf-8")
+    ok_v2 = encode_frame(json.dumps(
+        {"status": "success", "result": {},
+         "request_id": 1}).encode("utf-8"))
+    batch_items = [{"type": "set_tempo", "params": {"tempo": 120.0}},
+                   {"type": "get_session_info"}]
+    batch_v1 = json.dumps({"status": "success", "result": {
+        "results": [], "summary": {"total": 2, "succeeded": 2,
+                                   "failed": 0,
+                                   "skipped": 0}}}).encode("utf-8")
+
+    run("create_audio_clip, 20 s gap (MCP-09)", "v1", 65.0, ok_v1,
+        command="create_audio_clip")
+    rows.append({"scenario": "create_audio_clip, legacy v1 receive "
+                             "(definitional)",
+                 "framing": "v1", "budget_s": 15.0, "simulated_gap_s": gap,
+                 "outcome": "timed out at the 15 s cap"})
+    run("create_audio_clip, 20 s gap (MCP-09)", "v2", 65.0, ok_v2,
+        framing_v2=True, command="create_audio_clip")
+    run("execute_batch x2, 20 s gap (MCP-09)", "v1", 25.0, batch_v1,
+        batch=batch_items)
+    rows.append({"scenario": "execute_batch x2, legacy v1 receive "
+                             "(definitional)",
+                 "framing": "v1", "budget_s": 15.0, "simulated_gap_s": gap,
+                 "outcome": "timed out at the 15 s cap"})
+    run("get_session_info, 20 s gap - beyond the read budget", "v1",
+        10.0, ok_v1, command="get_session_info")
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", action="store_true",
@@ -1327,6 +1443,7 @@ def main(argv=None):
     results["bulk_tune"] = bench_bulk_tune()
     results["browser_browse"] = bench_browser_browse()
     results["passive_listeners"] = bench_passive_listeners()
+    results["timeout_budgets"] = bench_timeout_budgets()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
     results["projected_snapshots"] = bench_projected_snapshots()
@@ -1400,6 +1517,16 @@ def main(argv=None):
         print("  %-52s %10d %14d %13.1f" % (
             r["scenario"], r["listeners"], r["pending_events"],
             r["enqueue_wall_ms"]))
+    print()
+
+    print("B6. Timeout budgets vs simulated response gaps (MCP-09;")
+    print("    fake peer, gaps are virtual - no real waiting):")
+    print("  %-52s %7s %9s %7s  %s" % ("scenario", "framing", "budget s",
+                                     "gap s", "outcome"))
+    for r in results["timeout_budgets"]:
+        print("  %-52s %7s %9.0f %7.0f  %s" % (
+            r["scenario"], r["framing"], r["budget_s"],
+            r["simulated_gap_s"], r["outcome"]))
     print()
 
     print("C. Snapshot serialisation model (synthetic, audit 4.5 shape):")

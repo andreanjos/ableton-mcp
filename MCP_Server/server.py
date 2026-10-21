@@ -70,6 +70,55 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AbletonMCPServer")
 
+
+class OutcomeUnknownError(Exception):
+    """A command was fully sent but its outcome is unknown (MCP-09).
+
+    Raised by ``AbletonConnection.send_command`` / ``send_batch`` when
+    the request bytes were sent but no complete, parseable response
+    came back: the wait timed out, the connection dropped or reset
+    mid-response, the peer closed early, or the response bytes could
+    not be framed or parsed. The Remote Script may have executed the
+    command - for a state-modifying command its effect may already be
+    in the session - so callers must NOT blindly retry; reconcile
+    first (e.g. re-read the state the command would have changed).
+
+    Failures before the request was fully sent (connect refused, a
+    send error) and definitive answers (a script ``status: "error"``
+    envelope, a request-id echo mismatch) raise plain exceptions, as
+    before - never this type. It subclasses ``Exception`` directly, so
+    existing ``except Exception`` handling is unchanged; the type
+    itself (and the ``command_type`` attribute) is the marker callers
+    branch on.
+    """
+
+    def __init__(self, message, command_type=None):
+        super().__init__(message)
+        self.command_type = command_type
+
+
+# Wire commands that mutate session state. Used only to size socket
+# timeouts (dataset classification keeps its own lists).
+_MODIFYING_COMMANDS = [
+    "create_midi_track", "create_audio_track", "set_track_name",
+    "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
+    "delete_clip",
+    "clear_notes_from_clip",
+    "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
+    "set_device_parameters",
+    "start_playback", "stop_playback", "load_instrument_or_effect",
+    # Arrangement view commands
+    "switch_to_arrangement_view", "set_current_song_time",
+    "duplicate_session_clip_to_arrangement",
+    "create_locator"
+]
+
+# Commands whose work on Live's main thread can take noticeably longer
+# than the default modifying-command budget (e.g. importing/decoding a
+# large audio file): command type -> socket budget in seconds.
+_LONG_RUNNING_COMMAND_TIMEOUTS = {"create_audio_clip": 65.0}
+
+
 @dataclass
 class AbletonConnection:
     host: str
@@ -100,36 +149,68 @@ class AbletonConnection:
         if self.sock:
             return True
 
+        sock = None
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(5.0)
-            self.sock.connect((self.host, self.port))
-            self.sock.settimeout(None)
-            self._framing_v2 = False
-            self._next_request_id = 1
-            logger.info(f"Connected to Ableton at {self.host}:{self.port}")
-            return True
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((self.host, self.port))
+            sock.settimeout(None)
         except Exception as e:
             logger.error(f"Failed to connect to Ableton at {self.host}:{self.port}: {str(e)}")
+            if sock is not None:
+                # MCP-09: never abandon a created socket unclosed.
+                try:
+                    sock.close()
+                except Exception:
+                    pass
             self.sock = None
             return False
+        self.sock = sock
+        self._framing_v2 = False
+        self._next_request_id = 1
+        logger.info(f"Connected to Ableton at {self.host}:{self.port}")
+        return True
     
     def disconnect(self):
         """Disconnect from the Ableton Remote Script"""
         with self._lock:
-            if self.sock:
-                try:
-                    self.sock.close()
-                except Exception as e:
-                    logger.error(f"Error disconnecting from Ableton: {str(e)}")
-                finally:
-                    self.sock = None
-                    self._framing_v2 = False
+            self._drop_connection()
+
+    def _drop_connection(self):
+        """Close the socket (best effort) and reset per-connection state.
+
+        The single teardown path (MCP-09): disconnect() and every
+        send_command error path come through here, so a failed exchange
+        never leaves its socket open behind it, and the framing
+        adoption never survives the connection it was negotiated on.
+        Before MCP-09 the error paths simply assigned ``self.sock =
+        None`` - the socket was never closed and ``_framing_v2`` stayed
+        set until the next successful connect() happened to reset it.
+        ``_next_request_id`` is deliberately left alone: connect()
+        restarts allocation at 1, as before.
+        """
+        sock, self.sock = self.sock, None
+        self._framing_v2 = False
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception as e:
+                logger.error(f"Error disconnecting from Ableton: {str(e)}")
+
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
+        """Receive the complete v1 response, potentially in chunks.
+
+        The caller sets the socket timeout (the per-command budget,
+        see _command_timeout) and this path never overrides it. Before
+        MCP-09 it forced ``sock.settimeout(15.0)`` here, silently
+        capping every v1 exchange - including create_audio_clip's 65 s
+        budget and execute_batch's summed budget. A socket.timeout
+        mid-receive stops the wait; partial bytes are then salvaged if
+        they parse as a complete response, otherwise an exception is
+        raised for the caller to classify.
+        """
         chunks = []
-        sock.settimeout(15.0)  # Increased timeout for operations that might take longer
         
         try:
             while True:
@@ -200,9 +281,9 @@ class AbletonConnection:
         an invalid/oversized frame, and on any trailing bytes: the
         script answers one request with exactly one frame, so extra
         data means the stream is desynchronised and the caller must
-        drop the connection. Unlike receive_full_response this does
-        NOT touch the socket timeout - the caller sets the per-command
-        budget, so v2 exchanges honour it.
+        drop the connection. Like receive_full_response it does NOT
+        touch the socket timeout - the caller sets the per-command
+        budget before the exchange (MCP-09), so both paths honour it.
         """
         decoder = FrameDecoder()
         while True:
@@ -231,6 +312,14 @@ class AbletonConnection:
         indivisible exchange on a shared socket. Holding the lock across the
         whole round-trip (including reconnect) is what keeps a concurrent
         caller from reading someone else's reply.
+        Raises OutcomeUnknownError when the request was fully sent
+        but no complete response arrived (timeout, connection loss,
+        unparseable response): the command may have been applied, so
+        its outcome is unknown and it must not be blindly retried.
+        Failures before the send completes and definitive script
+        errors raise plain Exceptions, as before. The whole exchange
+        runs under the per-command socket budget (see
+        _command_timeout), which both receive paths honour.
         """
         with self._lock:
             return self._send_command_locked(command_type, params, request_id)
@@ -256,6 +345,12 @@ class AbletonConnection:
         a failed item does not roll back the items before it. Requires
         a Remote Script whose handshake advertises ``execute_batch``
         (script 1.7.3+); older scripts answer "Unknown command".
+
+        If the batch exchange itself fails after the request was sent
+        (timeout, connection loss, unparseable response), this raises
+        OutcomeUnknownError at batch granularity: the batch may have
+        partially applied and the per-item outcomes are unknowable, so
+        the batch must not be blindly retried.
         """
         if not isinstance(commands, list):
             raise ValueError(
@@ -264,6 +359,36 @@ class AbletonConnection:
                   "stop_on_error": bool(stop_on_error)}
         return self.send_command("execute_batch", params,
                                  request_id=request_id)
+
+    def _command_timeout(self, command_type: str,
+                         params: Dict[str, Any] = None) -> float:
+        """Socket budget in seconds for one exchange (MCP-09).
+
+        Long-running commands get their table entry; execute_batch sums
+        the per-item budgets (its script-side work is the sum of its
+        items), floored at the modifying-command default; other
+        modifying commands get 15 s and reads 10 s. The caller applies
+        the value to the socket before the request is sent, and since
+        MCP-09 neither receive path overrides it, so the budget a
+        command is assigned is the budget its exchange actually gets.
+        """
+        if command_type in _LONG_RUNNING_COMMAND_TIMEOUTS:
+            return _LONG_RUNNING_COMMAND_TIMEOUTS[command_type]
+        if command_type == "execute_batch":
+            timeout = 0.0
+            batch_params = params if isinstance(params, dict) else {}
+            for batch_item in batch_params.get("commands") or []:
+                item_type = (batch_item.get("type")
+                             if isinstance(batch_item, dict) else None)
+                if item_type in _LONG_RUNNING_COMMAND_TIMEOUTS:
+                    timeout += _LONG_RUNNING_COMMAND_TIMEOUTS[item_type]
+                elif item_type in _MODIFYING_COMMANDS:
+                    timeout += 15.0
+                else:
+                    timeout += 10.0
+            return max(timeout, 15.0)
+        return 15.0 if command_type in _MODIFYING_COMMANDS else 10.0
+
 
     def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None, request_id: int = None) -> Dict[str, Any]:
         if not self.sock and not self.connect():
@@ -298,27 +423,16 @@ class AbletonConnection:
                     "request_id must be an integer in [0, 9007199254740991]")
             command["request_id"] = request_id
         
-        # Check if this is a state-modifying command
-        modifying_commands = [
-            "create_midi_track", "create_audio_track", "set_track_name",
-            "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
-            "delete_clip",
-            "clear_notes_from_clip",
-            "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "set_device_parameters",
-            "start_playback", "stop_playback", "load_instrument_or_effect",
-            # Arrangement view commands
-            "switch_to_arrangement_view", "set_current_song_time",
-            "duplicate_session_clip_to_arrangement",
-            "create_locator"
-        ]
-        is_modifying_command = command_type in modifying_commands
-
-        # Commands whose work on Live's main thread can take noticeably longer
-        # than the default modifying-command budget (e.g. importing/decoding a
-        # large audio file). Give them a wider socket timeout so we don't time
-        # out before the Remote Script's own queue does.
-        long_running_commands = {"create_audio_clip": 65.0}
+        timeout = self._command_timeout(command_type, params)
+        if command_type == "execute_batch":
+            _unknown_tail = (
+                "the batch was fully sent, so it may have partially "
+                "applied; per-item outcomes are unknowable - outcome "
+                "unknown")
+        else:
+            _unknown_tail = (
+                "the request was fully sent, so the command may have "
+                "been applied - outcome unknown")
         
         try:
             if LEAN_PROFILE:
@@ -331,6 +445,15 @@ class AbletonConnection:
             else:
                 logger.info(f"Sending command: {command_type} with params: {params}")
             
+            # The per-command budget governs the WHOLE exchange
+            # (MCP-09): it is set before the request is sent, so neither
+            # the send nor either receive path can run under a leftover
+            # timeout from an earlier command (or the blocking mode
+            # connect() and the liveness peek leave behind). Before
+            # MCP-09 the budget was only set after sendall - and the v1
+            # receive path then overrode it with a hard 15 s anyway.
+            self.sock.settimeout(timeout)
+
             # Send the command. Under framing v2 the same JSON bytes
             # travel length-prefixed; the script answers in whichever
             # framing the request used, so this choice is per-connection
@@ -341,34 +464,35 @@ class AbletonConnection:
             self.sock.sendall(request_bytes)
             logger.info(f"Command sent, waiting for response...")
             
-            # Set timeout based on command type
-            if command_type in long_running_commands:
-                timeout = long_running_commands[command_type]
-            elif command_type == "execute_batch":
-                # One exchange whose script-side work is the sum of its
-                # items: budget like sending them one by one, so a long
-                # batch is not cut off at a single command's budget.
-                timeout = 0.0
-                batch_params = params if isinstance(params, dict) else {}
-                for batch_item in batch_params.get("commands") or []:
-                    item_type = (batch_item.get("type")
-                                 if isinstance(batch_item, dict) else None)
-                    if item_type == "create_audio_clip":
-                        timeout += 65.0
-                    elif item_type in modifying_commands:
-                        timeout += 15.0
-                    else:
-                        timeout += 10.0
-                timeout = max(timeout, 15.0)
-            else:
-                timeout = 15.0 if is_modifying_command else 10.0
-            self.sock.settimeout(timeout)
-
-            # Receive the response
-            if self._framing_v2:
-                response_data = self._receive_framed_response(self.sock)
-            else:
-                response_data = self.receive_full_response(self.sock)
+            # Receive the response. From here on the request has been
+            # fully sent, so any failure leaves the command's outcome
+            # unknown (MCP-09): it may have been applied in Live. Those
+            # failures raise OutcomeUnknownError, distinct from the
+            # plain Exceptions raised for pre-send failures and for
+            # definitive answers (error envelope, echo mismatch).
+            try:
+                if self._framing_v2:
+                    response_data = self._receive_framed_response(self.sock)
+                else:
+                    response_data = self.receive_full_response(self.sock)
+            except socket.timeout:
+                raise OutcomeUnknownError(
+                    "Timeout waiting for Ableton response to %r "
+                    "(budget %.0fs); %s"
+                    % (command_type, timeout, _unknown_tail),
+                    command_type=command_type)
+            except (ConnectionError, BrokenPipeError,
+                    ConnectionResetError) as e:
+                raise OutcomeUnknownError(
+                    "Connection to Ableton lost while waiting for the "
+                    "response to %r: %s; %s"
+                    % (command_type, str(e), _unknown_tail),
+                    command_type=command_type) from e
+            except Exception as e:
+                raise OutcomeUnknownError(
+                    "No complete response from Ableton to %r: %s; %s"
+                    % (command_type, str(e), _unknown_tail),
+                    command_type=command_type) from e
             logger.info(f"Received {len(response_data)} bytes of data")
 
             # Parse the response
@@ -395,23 +519,38 @@ class AbletonConnection:
                 self._note_script_info(response.get("result"))
 
             return response.get("result", {})
+        except OutcomeUnknownError:
+            # Raised by the receive phase above (and the JSONDecodeError
+            # handler below): the connection is dropped, the type and
+            # message are already the classification - pass it through.
+            self._drop_connection()
+            raise
         except socket.timeout:
+            # Only reachable before the request is fully sent (e.g. a
+            # send that blocks until the budget expires): the receive
+            # phase converts its own timeouts to OutcomeUnknownError.
             logger.error("Socket timeout while waiting for response from Ableton")
-            self.sock = None
+            self._drop_connection()
             raise Exception("Timeout waiting for Ableton response")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
+            self._drop_connection()
             raise Exception(f"Connection to Ableton lost: {str(e)}")
         except json.JSONDecodeError as e:
+            # A complete response arrived but is not JSON: the command
+            # may have been applied and its result is unreadable, so
+            # this too is outcome-unknown, not a plain failure.
             logger.error(f"Invalid JSON response from Ableton: {str(e)}")
             if 'response_data' in locals() and response_data:
                 logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            self.sock = None
-            raise Exception(f"Invalid response from Ableton: {str(e)}")
+            self._drop_connection()
+            raise OutcomeUnknownError(
+                "Invalid response from Ableton to %r: %s; %s"
+                % (command_type, str(e), _unknown_tail),
+                command_type=command_type) from e
         except Exception as e:
             logger.error(f"Error communicating with Ableton: {str(e)}")
-            self.sock = None
+            self._drop_connection()
             raise Exception(f"Communication error with Ableton: {str(e)}")
 
 @asynccontextmanager

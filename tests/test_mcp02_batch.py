@@ -316,11 +316,14 @@ def test_send_batch_stop_on_error_and_timeout_scale_with_items():
     sent = json.loads(conn.sock.sent[0].decode("utf-8"))
     assert sent["params"]["stop_on_error"] is True
     # Two small items: more than a single modifying command's 15 s,
-    # less than the sum with slack absurdity. timeouts[0] is the value
-    # _send_command_locked selected; receive_full_response then applies
-    # its own hard 15 s override (a pre-existing defect, MCP-09's scope,
-    # which equally caps create_audio_clip's 65 s today).
+    # less than the sum with slack absurdity. timeouts[0] is the budget
+    # _send_command_locked selected (15 for set_tempo + 10 for the
+    # unknown item), and since MCP-09 it is the ONLY timeout set for
+    # the exchange: both receive paths honour it (the v1 receive path
+    # previously overrode it with a hard 15 s, which equally capped
+    # create_audio_clip's 65 s).
     assert 15.0 < conn.sock.timeouts[0] <= 40.0
+    assert conn.sock.timeouts == [25.0]
 
 
 def test_send_batch_batch_level_error_raises():
