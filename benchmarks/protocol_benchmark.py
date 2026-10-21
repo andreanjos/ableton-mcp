@@ -1073,6 +1073,239 @@ def _print_parse_table(title, rows):
     print()
 
 
+# -- B5: passive listeners + event queue (MCP-08) ---------------------------
+
+class _BenchListenerHost(object):
+    """Live-style counted listener registry (benchmark fakes)."""
+
+    def __init__(self):
+        self._listeners = {}
+
+    def _add(self, kind, cb):
+        self._listeners.setdefault(kind, []).append(cb)
+
+    def _remove(self, kind, cb):
+        lst = self._listeners.get(kind, [])
+        if cb in lst:
+            lst.remove(cb)
+
+    def count(self):
+        return sum(len(v) for v in self._listeners.values())
+
+    def fire(self, kind):
+        for cb in list(self._listeners.get(kind, [])):
+            cb()
+
+
+def _bench_listener_methods(kind):
+    def add(self, cb):
+        self._add(kind, cb)
+
+    def remove(self, cb):
+        self._remove(kind, cb)
+
+    return add, remove
+
+
+class _BenchParam(_BenchListenerHost):
+    def __init__(self, value=0.5):
+        super().__init__()
+        self.value = value
+
+    add_value_listener, remove_value_listener = \
+        _bench_listener_methods("value")
+
+
+class _BenchClip(_BenchListenerHost):
+    def __init__(self, name):
+        super().__init__()
+        self.name = name
+        self.is_playing = False
+
+    add_name_listener, remove_name_listener = \
+        _bench_listener_methods("name")
+    add_notes_listener, remove_notes_listener = \
+        _bench_listener_methods("notes")
+    add_playing_status_listener, remove_playing_status_listener = \
+        _bench_listener_methods("playing_status")
+
+
+class _BenchSlot(_BenchListenerHost):
+    def __init__(self, clip=None):
+        super().__init__()
+        self.has_clip = clip is not None
+        self.clip = clip
+
+    add_has_clip_listener, remove_has_clip_listener = \
+        _bench_listener_methods("has_clip")
+
+
+class _BenchMixer(object):
+    def __init__(self):
+        self.volume = _BenchParam(0.85)
+        self.panning = _BenchParam(0.0)
+
+
+class _BenchTrack(_BenchListenerHost):
+    def __init__(self, name, slots):
+        super().__init__()
+        self.name = name
+        self.mute = False
+        self.solo = False
+        self.arm = False
+        self.can_be_armed = True
+        self.devices = []
+        self.clip_slots = list(slots)
+        self.mixer_device = _BenchMixer()
+
+    add_name_listener, remove_name_listener = \
+        _bench_listener_methods("name")
+    add_mute_listener, remove_mute_listener = \
+        _bench_listener_methods("mute")
+    add_solo_listener, remove_solo_listener = \
+        _bench_listener_methods("solo")
+    add_arm_listener, remove_arm_listener = _bench_listener_methods("arm")
+    add_devices_listener, remove_devices_listener = \
+        _bench_listener_methods("devices")
+
+
+class _BenchSong(_BenchListenerHost):
+    def __init__(self, tracks):
+        super().__init__()
+        self.tracks = list(tracks)
+        self.tempo = 120.0
+        self.signature_numerator = 4
+        self.signature_denominator = 4
+        self.is_playing = False
+
+    add_tempo_listener, remove_tempo_listener = \
+        _bench_listener_methods("tempo")
+    add_signature_numerator_listener, \
+        remove_signature_numerator_listener = \
+        _bench_listener_methods("signature_numerator")
+    add_signature_denominator_listener, \
+        remove_signature_denominator_listener = \
+        _bench_listener_methods("signature_denominator")
+    add_is_playing_listener, remove_is_playing_listener = \
+        _bench_listener_methods("is_playing")
+    add_tracks_listener, remove_tracks_listener = \
+        _bench_listener_methods("tracks")
+
+
+def _bench_busy_song(track_count=8, slots_per_track=16):
+    """A busy session: every other slot holds a clip."""
+    tracks = []
+    for t in range(track_count):
+        slots = []
+        for c in range(slots_per_track):
+            clip = _BenchClip("Clip %d/%d" % (t, c)) if c % 2 == 0 else None
+            slots.append(_BenchSlot(clip))
+        tracks.append(_BenchTrack("Track %d" % t, slots))
+    return _BenchSong(tracks)
+
+
+def _bench_passive_instance(mod, song):
+    from collections import deque
+    inst = mod.AbletonMCP.__new__(mod.AbletonMCP)
+    inst.log_message = lambda *a, **k: None
+    inst.show_message = lambda *a, **k: None
+    inst.schedule_message = lambda delay, fn: fn()
+    inst._song = song
+    inst._passive_events = deque()
+    inst._passive_lock = threading.Lock()
+    inst._passive_max = mod.PASSIVE_EVENT_QUEUE_MAX
+    inst._passive_dropped = 0
+    inst._passive_listeners_enabled = False
+    inst._passive_track_count = None
+    inst._passive_track_bindings = []
+    inst._passive_clip_bindings = {}
+    inst._song_passive_callbacks = []
+    inst._dispatch_state = threading.local()
+    return inst
+
+
+def bench_passive_listeners():
+    """B5 (MCP-08): listener census + event-queue behaviour.
+
+    A busy session (8 tracks x 16 slots, half occupied) used to carry
+    its full listener census from script startup, forever, whether or
+    not any consumer ever drained an event. With negotiation the
+    census exists only while a consumer has it enabled. The flood
+    rows replay 5,000 fader moves on one track: pre-MCP-08 every move
+    enqueued (the queue then sat at its 500 cap, re-slicing the whole
+    list per event - the legacy enqueue below is those exact lines);
+    MCP-08 coalesces the stream to the single latest value and the
+    bounded deque appends in O(1).
+    """
+    mod = _load_remote_script_module()
+    rows = []
+
+    song = _bench_busy_song()
+    inst = _bench_passive_instance(mod, song)
+    rows.append({
+        "scenario": "registered listeners, session never enables events",
+        "listeners": inst._passive_listener_count(),
+        "pending_events": 0,
+        "enqueue_wall_ms": 0.0,
+    })
+    inst._set_passive_listeners(True)
+    rows.append({
+        "scenario": "registered listeners, enabled (= pre-MCP-08 always-on)",
+        "listeners": inst._passive_listener_count(),
+        "pending_events": 0,
+        "enqueue_wall_ms": 0.0,
+    })
+
+    # Flood: 5,000 fader moves. Legacy pending count is definitional
+    # (one append per move, capped at 500); MCP-08 is measured live.
+    volume = song.tracks[0].mixer_device.volume
+    started = time.perf_counter()
+    for i in range(5000):
+        volume.value = (i % 100) / 100.0
+        volume.fire("value")
+    flood_ms = (time.perf_counter() - started) * 1000.0
+    rows.append({
+        "scenario": "5,000 fader moves, MCP-08 coalesced queue",
+        "listeners": inst._passive_listener_count(),
+        "pending_events": len(inst._passive_events),
+        "enqueue_wall_ms": flood_ms,
+    })
+    rows.append({
+        "scenario": "5,000 fader moves, pre-MCP-08 queue (definitional)",
+        "listeners": inst._passive_listener_count(),
+        "pending_events": mod.PASSIVE_EVENT_QUEUE_MAX,
+        "enqueue_wall_ms": 0.0,
+    })
+
+    # Enqueue cost at the cap: legacy list+slice vs the bounded deque,
+    # 20,000 discrete events each.
+    legacy_events = []
+    started = time.perf_counter()
+    for i in range(20000):
+        legacy_events.append({"type": "name_changed", "i": i})
+        if len(legacy_events) > mod.PASSIVE_EVENT_QUEUE_MAX:
+            legacy_events = legacy_events[-mod.PASSIVE_EVENT_QUEUE_MAX:]
+    legacy_ms = (time.perf_counter() - started) * 1000.0
+    rows.append({
+        "scenario": "20,000 events at cap, legacy list+slice enqueue",
+        "listeners": 0,
+        "pending_events": len(legacy_events),
+        "enqueue_wall_ms": legacy_ms,
+    })
+    inst2 = _bench_passive_instance(mod, _bench_busy_song())
+    started = time.perf_counter()
+    for i in range(20000):
+        inst2._enqueue_passive("name_changed", {"i": i}, track_index=0)
+    deque_ms = (time.perf_counter() - started) * 1000.0
+    rows.append({
+        "scenario": "20,000 events at cap, MCP-08 deque enqueue",
+        "listeners": 0,
+        "pending_events": len(inst2._passive_events),
+        "enqueue_wall_ms": deque_ms,
+    })
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", action="store_true",
@@ -1093,6 +1326,7 @@ def main(argv=None):
     results["batch_round_trips"] = bench_batch_round_trips()
     results["bulk_tune"] = bench_bulk_tune()
     results["browser_browse"] = bench_browser_browse()
+    results["passive_listeners"] = bench_passive_listeners()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
     results["projected_snapshots"] = bench_projected_snapshots()
@@ -1157,6 +1391,15 @@ def main(argv=None):
         print("  %-42s %13d %16d %10.1f" % (
             r["workflow"], r["wire_requests"], r["hierarchy_walks"],
             r["wall_ms"]))
+    print()
+
+    print("B5. Passive listeners + event queue (MCP-08):")
+    print("  %-52s %10s %14s %13s" % ("scenario", "listeners",
+                                     "pending events", "enqueue ms"))
+    for r in results["passive_listeners"]:
+        print("  %-52s %10d %14d %13.1f" % (
+            r["scenario"], r["listeners"], r["pending_events"],
+            r["enqueue_wall_ms"]))
     print()
 
     print("C. Snapshot serialisation model (synthetic, audit 4.5 shape):")

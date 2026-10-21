@@ -498,6 +498,39 @@ answers the two new commands with the standard
 `Unknown command: ...` error, which the tools surface as their
 usual Error strings.
 
+### Passive listeners (negotiated)
+
+The Remote Script's passive listeners - the song/track/clip census
+whose events `drain_passive_events` returns - used to be registered
+at script startup and stay registered forever, whether or not any
+consumer ever drained an event. Since 1.7.8 they are registered
+only when a consumer enables them:
+
+- The `set_passive_listeners` command (and the MCP tool of the same
+  name) toggles registration: `{"enabled": true}` registers the
+  census, `{"enabled": false}` removes every listener, and omitting
+  `enabled` just reports the current state. The handshake advertises
+  the negotiation (`agent0_passive_listeners_negotiated`) and the
+  live state (`passive_listeners_enabled`).
+- The dataset poller - the in-repo consumer - enables the listeners
+  while it runs (dataset consent on) and disables them when it
+  stops, so the dataset event flow is unchanged. A session that
+  never enables events registers no listeners at all.
+- Clip listeners are tracked per slot and removed when their clip
+  goes away: previously, listeners bound when a slot's clip changed
+  were recorded nowhere and accumulated on every toggle.
+- Continuous value events (`volume_changed`, `panning_changed`,
+  `tempo_changed`) coalesce latest-value-wins per source instead of
+  enqueueing every intermediate value; discrete events never
+  coalesce. The event queue is bounded at 500 events, drops the
+  oldest on overflow, and reports the drop count in the next
+  `drain_passive_events` result as `"dropped"`.
+
+Requires Remote Script 1.7.8+. An older script's listeners are
+always registered and cannot be toggled; it answers
+`set_passive_listeners` with the standard `Unknown command: ...`
+error, which the tool surfaces as its usual Error string.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
@@ -506,7 +539,8 @@ framing cost on both endpoints against fake sockets, round-trip counts for
 representative composite workflows against a fake TCP peer, a synthetic
 snapshot serialisation model, full vs projected snapshot sizes from
 the real serializer, and a browser browse-then-find scenario counting
-wire requests and hierarchy walks. Add `--json` for machine-readable output.
+wire requests and hierarchy walks, plus a passive-listener census /
+event-queue scenario. Add `--json` for machine-readable output.
 
 ## Limitations & Security Considerations
 

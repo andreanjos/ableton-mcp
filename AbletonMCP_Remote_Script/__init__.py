@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 import struct
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 # Change queue import for Python 2
 try:
@@ -36,7 +36,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.7"
+SCRIPT_VERSION = "1.7.8"
 PROTOCOL_VERSION = 1
 
 # Complete command surface of the _process_command dispatcher, kept sorted.
@@ -79,6 +79,7 @@ SCRIPT_CAPABILITIES = [
     "set_current_song_time",
     "set_device_parameter",
     "set_device_parameters",
+    "set_passive_listeners",
     "set_tempo",
     "set_track_name",
     "start_playback",
@@ -108,6 +109,22 @@ MAX_BULK_PARAMETERS = 1000
 # _invalidate_browser_caches) instead of growing forever.
 MAX_BROWSER_URI_CACHE_ENTRIES = 512
 MAX_BROWSER_READ_CACHE_ENTRIES = 128
+
+# MCP-08: passive-listener diet. The LOM listener census (song, per
+# track, per clip slot, per clip) is registered only after a consumer
+# enables it via set_passive_listeners; the event queue is a bounded
+# deque - drop-oldest with a counted drop total - instead of a list
+# whose overflow slice copied the whole queue on every event.
+PASSIVE_EVENT_QUEUE_MAX = 500
+# Continuous value streams coalesce latest-value-wins per
+# (type, track_index, clip_index): a consumer draining after a fader
+# drag needs the final value, not every intermediate one. Discrete
+# events (names, mute, notes, ...) never coalesce.
+PASSIVE_COALESCE_TYPES = frozenset([
+    "volume_changed",
+    "panning_changed",
+    "tempo_changed",
+])
 
 # MCP-07: paging bounds for the opt-in get_browser_items_at_path page
 # form and for search_browser.
@@ -257,23 +274,27 @@ class AbletonMCP(ControlSurface):
         # Cache the song reference for easier access
         self._song = self.song()
 
-        # Passive human-UI event queue (drained by MCP → Supabase)
-        self._passive_events = []
+        # Passive human-UI event queue (drained by MCP → Supabase).
+        # MCP-08: listeners are NOT registered here - a consumer
+        # enables them with set_passive_listeners (the MCP dataset
+        # poller does so while dataset consent is on). Until then the
+        # script carries no LOM listener overhead at all.
+        self._passive_events = deque()
         self._passive_lock = threading.Lock()
-        self._passive_max = 500
+        self._passive_max = PASSIVE_EVENT_QUEUE_MAX
+        self._passive_dropped = 0
+        self._passive_listeners_enabled = False
         self._passive_track_count = None
         self._passive_track_bindings = []  # (track, [(add_name, callback), ...]) for cleanup
+        self._passive_clip_bindings = {}  # (track_index, clip_index) -> (clip, [(add_name, callback), ...])
         self._song_passive_callbacks = []
         
         # Start the socket server
         self.start_server()
 
-        # Register LOM listeners for passive capture (after song is ready)
-        try:
-            self._setup_passive_listeners()
-        except Exception as e:
-            self.log_message("Passive listener setup failed: " + str(e))
-            self.log_message(traceback.format_exc())
+        # MCP-08: no passive LOM listeners are registered at startup.
+        # Registration happens only on set_passive_listeners (see
+        # _set_passive_listeners), negotiated per session.
         
         self.log_message("AbletonMCP initialized")
         
@@ -887,6 +908,50 @@ class AbletonMCP(ControlSurface):
                 except queue.Empty:
                     response["status"] = "error"
                     response["message"] = "Timeout waiting for operation to complete"
+            elif command_type == "set_passive_listeners":
+                # MCP-08: listener registration touches the LOM, so
+                # the toggle runs on the main thread like the other
+                # state-changing commands. An omitted "enabled" just
+                # reports the current state.
+                response_queue = queue.Queue()
+
+                def main_thread_task():
+                    try:
+                        if "enabled" in params:
+                            result = self._set_passive_listeners(
+                                bool(params.get("enabled")))
+                        else:
+                            result = {
+                                "enabled": bool(getattr(
+                                    self, "_passive_listeners_enabled",
+                                    False)),
+                                "changed": False,
+                                "listener_count":
+                                    self._passive_listener_count(),
+                            }
+                        response_queue.put(
+                            {"status": "success", "result": result})
+                    except Exception as e:
+                        self.log_message(
+                            "Error in main thread task: " + str(e))
+                        self.log_message(traceback.format_exc())
+                        response_queue.put(
+                            {"status": "error", "message": str(e)})
+
+                self._schedule_main_thread_task(main_thread_task, timing_state)
+
+                try:
+                    task_response = response_queue.get(timeout=10.0)
+                    if task_response.get("status") == "error":
+                        response["status"] = "error"
+                        response["message"] = task_response.get(
+                            "message", "Unknown error")
+                    else:
+                        response["result"] = task_response.get("result", {})
+                except queue.Empty:
+                    response["status"] = "error"
+                    response["message"] = \
+                        "Timeout waiting for operation to complete"
             elif command_type == "set_device_parameters":
                 # MCP-06: apply the whole parameter list inside one
                 # main-thread scheduling (see _set_device_parameters).
@@ -1051,6 +1116,9 @@ class AbletonMCP(ControlSurface):
             "capabilities": list(SCRIPT_CAPABILITIES),
             "snapshot_schema": "ableton_mcp_snapshot_v2",
             "passive_listeners": True,
+            "agent0_passive_listeners_negotiated": True,
+            "passive_listeners_enabled": bool(
+                getattr(self, "_passive_listeners_enabled", False)),
             "agent0_request_ids": True,
             "agent0_framing": ["v1", "v2"],
             "agent0_capabilities_complete": True,
@@ -2304,7 +2372,16 @@ class AbletonMCP(ControlSurface):
     # ── Passive human-UI listeners ──────────────────────────────────────────────
 
     def _enqueue_passive(self, event_type, detail=None, track_index=None, clip_index=None):
-        """Append a coarse human-UI event (capped FIFO)."""
+        """Append a coarse human-UI event to the bounded queue.
+
+        MCP-08: the queue is a deque capped at self._passive_max -
+        appending is O(1) and overflow drops the oldest event in O(1)
+        (the previous list implementation re-sliced the whole queue
+        on every event once the cap was reached). Drops are counted
+        in _passive_dropped and reported by the next drain. Value
+        streams in PASSIVE_COALESCE_TYPES coalesce latest-value-wins
+        per (type, track_index, clip_index) instead of enqueueing.
+        """
         evt = {
             "type": event_type,
             "ts": time.time(),
@@ -2313,16 +2390,74 @@ class AbletonMCP(ControlSurface):
             "detail": detail if detail is not None else {},
         }
         with self._passive_lock:
+            if event_type in PASSIVE_COALESCE_TYPES:
+                for pending in self._passive_events:
+                    if (pending["type"] == event_type
+                            and pending["track_index"] == track_index
+                            and pending["clip_index"] == clip_index):
+                        pending["detail"] = evt["detail"]
+                        pending["ts"] = evt["ts"]
+                        return
+            if len(self._passive_events) >= self._passive_max:
+                self._passive_events.popleft()
+                self._passive_dropped = \
+                    getattr(self, "_passive_dropped", 0) + 1
             self._passive_events.append(evt)
-            if len(self._passive_events) > self._passive_max:
-                self._passive_events = self._passive_events[-self._passive_max:]
 
     def _drain_passive_events(self):
-        """Return and clear the passive event queue (called by MCP poller)."""
+        """Return and clear the passive event queue (called by MCP poller).
+
+        MCP-08: the result also carries "dropped" - events the
+        bounded queue dropped since the previous drain - which is
+        reset here, so a consumer can tell a quiet period from a
+        flooded one.
+        """
         with self._passive_lock:
             events = list(self._passive_events)
-            self._passive_events = []
-        return {"events": events, "count": len(events)}
+            self._passive_events.clear()
+            dropped = getattr(self, "_passive_dropped", 0)
+            self._passive_dropped = 0
+        return {"events": events, "count": len(events), "dropped": dropped}
+
+    def _passive_listener_count(self):
+        """Total LOM listeners currently registered for passive capture."""
+        total = len(getattr(self, "_song_passive_callbacks", []))
+        for _track, bindings in getattr(self, "_passive_track_bindings", []):
+            total += len(bindings)
+        for _clip, bindings in getattr(
+                self, "_passive_clip_bindings", {}).values():
+            total += len(bindings)
+        return total
+
+    def _set_passive_listeners(self, enabled):
+        """Register or remove the passive LOM listener census (MCP-08).
+
+        Listeners exist only while a consumer wants the event flow:
+        the MCP dataset poller enables them while dataset consent is
+        on, and any client may toggle them with the
+        set_passive_listeners command. Idempotent: enabling an
+        enabled script (or disabling a disabled one) changes nothing.
+        Returns the resulting state for the command response.
+        """
+        enabled = bool(enabled)
+        current = bool(getattr(self, "_passive_listeners_enabled", False))
+        if enabled == current:
+            return {
+                "enabled": current,
+                "changed": False,
+                "listener_count": self._passive_listener_count(),
+            }
+        if enabled:
+            self._setup_passive_listeners()
+            self._passive_listeners_enabled = True
+        else:
+            self._teardown_passive_listeners()
+            self._passive_listeners_enabled = False
+        return {
+            "enabled": self._passive_listeners_enabled,
+            "changed": True,
+            "listener_count": self._passive_listener_count(),
+        }
 
     def _safe_add_listener(self, obj, add_name, callback):
         try:
@@ -2341,7 +2476,12 @@ class AbletonMCP(ControlSurface):
             pass
 
     def _setup_passive_listeners(self):
-        """Register high-signal LOM listeners for Mode C / assisted human edits."""
+        """Register high-signal LOM listeners for Mode C / assisted human edits.
+
+        MCP-08: called only from _set_passive_listeners (a consumer
+        negotiated the event flow on) or not at all - never from
+        __init__.
+        """
         song = self._song
 
         def on_tempo():
@@ -2410,6 +2550,7 @@ class AbletonMCP(ControlSurface):
         song = getattr(self, "_song", None)
         for suffix, cb in getattr(self, "_song_passive_callbacks", []):
             self._safe_remove_listener(song, "remove_" + suffix, cb)
+        self._song_passive_callbacks = []
         self._clear_track_listeners()
 
     def _clear_track_listeners(self):
@@ -2422,6 +2563,25 @@ class AbletonMCP(ControlSurface):
                 else:
                     self._safe_remove_listener(track, remove_name, callback)
         self._passive_track_bindings = []
+        # MCP-08: clip bindings live in their own registry (see
+        # _bind_clip_listeners); a track-level clear removes them all.
+        clip_bindings = getattr(self, "_passive_clip_bindings", {})
+        for key in list(clip_bindings.keys()):
+            self._unbind_clip_listeners(*key)
+
+    def _unbind_clip_listeners(self, track_index, clip_index):
+        """Remove one slot's tracked clip listeners, if any (MCP-08)."""
+        clip_bindings = getattr(self, "_passive_clip_bindings", None)
+        if clip_bindings is None:
+            self._passive_clip_bindings = clip_bindings = {}
+        entry = clip_bindings.pop((track_index, clip_index), None)
+        if not entry:
+            return
+        clip, bindings = entry
+        for add_name, callback in bindings:
+            remove_name = "remove_" + add_name[len("add_"):]
+            target = getattr(callback, "_passive_target", None) or clip
+            self._safe_remove_listener(target, remove_name, callback)
 
     def _rebind_track_listeners(self):
         self._clear_track_listeners()
@@ -2511,6 +2671,16 @@ class AbletonMCP(ControlSurface):
             self._passive_track_bindings.append((track, bindings))
 
     def _bind_clip_listeners(self, track_index, clip_index, bindings=None):
+        # MCP-08 (leak fix): bindings are tracked in
+        # _passive_clip_bindings, keyed by slot, and any previous set
+        # for the slot is removed before binding anew. Historically
+        # the slot callback called this without the bindings list, so
+        # its listeners were recorded nowhere: every slot toggle added
+        # three more clip callbacks that teardown never removed. The
+        # bindings parameter is still accepted (the rebind loop passes
+        # its per-track list) but storage is always the registry, so
+        # both call paths are tracked exactly once.
+        self._unbind_clip_listeners(track_index, clip_index)
         try:
             track = self._song.tracks[track_index]
             slot = track.clip_slots[clip_index]
@@ -2552,6 +2722,7 @@ class AbletonMCP(ControlSurface):
                     clip_index=clip_index,
                 )
 
+            bound = []
             for add_name, cb in [
                 ("add_name_listener", on_name),
                 ("add_notes_listener", on_notes),
@@ -2559,8 +2730,12 @@ class AbletonMCP(ControlSurface):
             ]:
                 cb._passive_target = clip
                 if self._safe_add_listener(clip, add_name, cb):
-                    if bindings is not None:
-                        bindings.append((add_name, cb))
+                    bound.append((add_name, cb))
+            if bound:
+                clip_bindings = getattr(self, "_passive_clip_bindings", None)
+                if clip_bindings is None:
+                    self._passive_clip_bindings = clip_bindings = {}
+                clip_bindings[(track_index, clip_index)] = (clip, bound)
         except Exception as e:
             self.log_message(
                 "bind clip listeners %d/%d failed: %s"
