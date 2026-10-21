@@ -101,7 +101,7 @@ def test_capabilities_are_the_complete_dispatcher_surface(script_module):
 def test_handshake_advertises_complete_capabilities_and_markers(script_module):
     info = make_instance(script_module)._get_script_info()
     assert info["protocol_version"] == 1
-    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.9"
+    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.10"
     assert info["capabilities"] == script_module.SCRIPT_CAPABILITIES
     assert len(info["capabilities"]) == 42
     assert info["agent0_request_ids"] is True

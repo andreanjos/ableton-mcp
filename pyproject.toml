@@ -18,6 +18,13 @@ dependencies = [
     "supabase>=2.0.0",
 ]
 
+[dependency-groups]
+# Dev-only tools. `uv run pytest` syncs this group automatically, so the
+# test suite runs with one command and no --with workaround.
+dev = [
+    "pytest>=8",
+]
+
 [project.scripts]
 ableton-mcp = "MCP_Server.server:main"
 ableton-mcp-install-script = "MCP_Server.remote_script_install:main"

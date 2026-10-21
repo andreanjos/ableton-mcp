@@ -23,7 +23,7 @@ Pins:
   move_to_end touch can no longer raise KeyError out of
   _browser_cache_get / _browser_cache_put, and cache semantics
   (bounds, LRU order, invalidation) are unchanged;
-* script version lockstep at 1.7.9 (script + installer constant).
+* script version lockstep at 1.7.10 (script + installer constant).
 """
 
 import ast
@@ -346,7 +346,7 @@ def test_browser_caches_survive_concurrent_use():
 # ------------------------------------------------------------ lockstep
 
 def test_script_version_lockstep():
-    assert script_module.SCRIPT_VERSION == "1.7.9"
+    assert script_module.SCRIPT_VERSION == "1.7.10"
     from MCP_Server.remote_script_install import (
         EXPECTED_REMOTE_SCRIPT_VERSION)
     assert EXPECTED_REMOTE_SCRIPT_VERSION == script_module.SCRIPT_VERSION

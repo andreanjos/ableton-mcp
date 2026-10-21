@@ -313,7 +313,11 @@ command. The request params are `{"commands": [{"type": ...,
 "params": {...}}, ...], "stop_on_error": false}`. The result is
 `{"results": [...], "summary": {"total": n, "succeeded": n, "failed":
 n, "skipped": n}}`, where each entry of `results` is exactly the
-response envelope a direct call of that command would have produced.
+response envelope a direct call of that command would have produced
+for items that reach dispatch; an item rejected before dispatch
+(malformed, a nested batch) reports a batch-style error envelope
+instead - the same message, without the `result` key a dispatched
+call's envelope carries.
 With `"stop_on_error": true`, items after the first failure are not
 run and are reported as `{"status": "skipped", ...}` - never silently
 dropped. A batch inside a batch is rejected as a per-item error.
@@ -380,9 +384,11 @@ Snapshot parameters (all optional):
 
 Track info parameters: `include_clip_slots` and `include_devices`, with
 the same omit-when-false semantics. The `get_session_snapshot` and
-`get_track_info` MCP tools expose the same parameters and forward only
-the values a caller actually set, so a default tool call sends exactly
-the params it sent before. Measured with the benchmark below (real
+`get_track_info` MCP tools expose the same parameters: `track_indices`
+and `include_automation` are forwarded when set, and each boolean flag
+only when it differs from its default (an explicitly passed `True` is
+not sent - the script's defaults are also `True`, so the result is the
+same), so a default tool call sends exactly the params it sent before. Measured with the benchmark below (real
 serializer, fake Live set): a full 128-track snapshot is about 2.5 MB;
 asking for one track brings back about 31 KB at any set size. Requires
 Remote Script 1.7.5+ for the projection to take effect; older scripts
@@ -697,6 +703,17 @@ Give feedback, get inspired, and build on top of the MCP: [**Discord**](https://
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+### Running the tests
+
+The test suite is headless - no Ableton Live required:
+
+```bash
+uv run pytest
+```
+
+pytest is declared in the project's dev dependency group, which `uv`
+syncs automatically, so that one command is the whole setup.
 
 ## Disclaimer
 
