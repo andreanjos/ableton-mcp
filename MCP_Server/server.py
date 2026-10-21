@@ -1582,6 +1582,39 @@ def refresh_browser_cache(ctx: Context, user_prompt: str = "") -> str:
         logger.error(f"Error refreshing browser cache: {str(e)}")
         return f"Error refreshing browser cache: {str(e)}"
 
+@mcp.tool()
+@rich_telemetry_tool("set_passive_listeners")
+@trajectory_tool("set_passive_listeners")
+def set_passive_listeners(ctx: Context, enabled: bool = True, user_prompt: str = "") -> str:
+    """
+    Enable or disable the Remote Script's passive LOM listeners.
+
+    Since MCP-08 (Remote Script 1.7.8) the script registers its
+    passive listeners - the song/track/clip census whose events feed
+    drain_passive_events - only when a consumer asks. The dataset
+    poller enables them automatically while dataset consent is on;
+    call this tool to run the event flow without the dataset, or to
+    switch the listeners off again. Toggling is idempotent.
+
+    Parameters:
+    - enabled: True registers the listeners, False removes them all
+      (default True)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Returns JSON: {"enabled", "changed", "listener_count"}.
+    Requires Remote Script 1.7.8+; an older script answers with the
+    standard "Unknown command: set_passive_listeners" error (its
+    listeners are always registered and cannot be toggled).
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command(
+            "set_passive_listeners", {"enabled": bool(enabled)})
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error setting passive listeners: {str(e)}")
+        return f"Error setting passive listeners: {str(e)}"
+
 
 @mcp.tool()
 @rich_telemetry_tool("load_drum_kit")

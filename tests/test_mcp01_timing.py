@@ -93,7 +93,7 @@ def _dispatcher_commands():
 
 def test_capabilities_are_the_complete_dispatcher_surface(script_module):
     derived = _dispatcher_commands()
-    assert len(derived) == 41  # 37 base + execute_batch + set_device_parameters + search/refresh
+    assert len(derived) == 42  # 37 base + execute_batch + set_device_parameters + search/refresh + set_passive_listeners
     assert set(script_module.SCRIPT_CAPABILITIES) == derived
     assert script_module.SCRIPT_CAPABILITIES == sorted(derived)
 
@@ -101,9 +101,9 @@ def test_capabilities_are_the_complete_dispatcher_surface(script_module):
 def test_handshake_advertises_complete_capabilities_and_markers(script_module):
     info = make_instance(script_module)._get_script_info()
     assert info["protocol_version"] == 1
-    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.7"
+    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.8"
     assert info["capabilities"] == script_module.SCRIPT_CAPABILITIES
-    assert len(info["capabilities"]) == 41
+    assert len(info["capabilities"]) == 42
     assert info["agent0_request_ids"] is True
     assert info["agent0_capabilities_complete"] is True
     assert info["agent0_host_revision"] == 1
@@ -227,8 +227,8 @@ def test_host_patch_anchor_strings_preserved():
     seg = "".join(lines[method.lineno - 1:method.end_lineno])
     assert seg.count('        command_type = command.get("type", "")') == 1
     assert seg.count('response["result"] = self._get_script_info()') == 1
-    assert seg.count("                def main_thread_task():\n") == 2
-    assert seg.count("                        response_queue.put(") == 4
+    assert seg.count("                def main_thread_task():\n") == 3  # + set_passive_listeners (MCP-08)
+    assert seg.count("                        response_queue.put(") == 6  # 3 main-thread tasks x success/error
     assert seg.count("        return response\n") == 1
 
 

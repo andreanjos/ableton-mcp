@@ -26,6 +26,12 @@ class PassiveEventPoller:
         self._thread: threading.Thread | None = None
         self._pending_snapshot = False
         self._last_burst_ts = 0.0
+        # MCP-08 listener negotiation: settled once the script has
+        # been asked to register its passive listeners (or once it is
+        # known to predate the negotiation); enabled_by_us records
+        # that WE sent the enable, so stop() can release it.
+        self._negotiation_settled = False
+        self._listeners_enabled_by_us = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -43,6 +49,47 @@ class PassiveEventPoller:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=self.interval + 1.0)
         self._thread = None
+        # MCP-08: release the listener registration we negotiated, so
+        # a stopped poller leaves no listener overhead inside Live.
+        # Best-effort: the connection may already be gone at shutdown.
+        if self._listeners_enabled_by_us:
+            self._listeners_enabled_by_us = False
+            self._negotiation_settled = False
+            try:
+                from ..server import get_ableton_connection
+
+                get_ableton_connection().send_command(
+                    "set_passive_listeners", {"enabled": False})
+                logger.info("Passive listeners disabled in Remote Script")
+            except Exception as e:
+                logger.debug("Passive listener disable failed: %s", e)
+
+    def _ensure_listeners_enabled(self, ableton) -> None:
+        """Negotiate passive-listener registration with the script.
+
+        MCP-08: scripts from 1.7.8 register their LOM listeners only
+        when a consumer enables them; the poller is that consumer
+        while dataset consent is on. Older scripts register
+        unconditionally and do not advertise the command - for them
+        there is nothing to send. A failed send leaves negotiation
+        unsettled so the next tick retries (the script may have
+        restarted and lost the toggle).
+        """
+        if self._negotiation_settled:
+            return
+        from ..script_handshake import script_has_capability
+
+        if not script_has_capability("set_passive_listeners"):
+            self._negotiation_settled = True
+            return
+        try:
+            ableton.send_command("set_passive_listeners", {"enabled": True})
+        except Exception as e:
+            logger.debug("Passive listener enable failed: %s", e)
+            return
+        self._negotiation_settled = True
+        self._listeners_enabled_by_us = True
+        logger.info("Passive listeners enabled in Remote Script")
 
     def _loop(self) -> None:
         while not self._stop.wait(self.interval):
@@ -71,6 +118,7 @@ class PassiveEventPoller:
             return
 
         ableton = get_ableton_connection()
+        self._ensure_listeners_enabled(ableton)
         result = ableton.send_command("drain_passive_events")
         events = result.get("events") or []
 
