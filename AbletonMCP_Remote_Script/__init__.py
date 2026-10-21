@@ -36,57 +36,118 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.8"
+SCRIPT_VERSION = "1.7.9"
 PROTOCOL_VERSION = 1
 
-# Complete command surface of the _process_command dispatcher, kept sorted.
-# A fork test derives the dispatcher's command set from this file's AST and
-# pins this list to it, so the handshake can never again advertise a subset
-# of what the script implements (it once advertised 19 of 37 commands).
-SCRIPT_CAPABILITIES = [
-    "add_notes_to_clip",
-    "clear_notes_from_clip",
-    "create_audio_clip",
-    "create_audio_track",
-    "create_clip",
-    "create_locator",
-    "create_midi_track",
-    "delete_clip",
-    "drain_passive_events",
-    "duplicate_session_clip_to_arrangement",
+# MCP-10: the dispatcher table - the single source for the handshake
+# capabilities and for each command's thread class.
+#
+# Thread classes:
+#
+# * "main": the command's handler touches the Live object model
+#   (self._song / self.application(), directly or through a helper),
+#   and Live's API is main-thread-only, so _process_command dispatches
+#   it through a main-thread scheduling (see _schedule_main_thread_task)
+#   and waits on a response queue. Every "main" entry was classified
+#   from its handler's code in the MCP-10 audit; read-only is not
+#   exempt - a handler that only reads the LOM (inspect_rack) is
+#   still a LOM access.
+#
+# * "handler": the command executes on the calling (socket) thread,
+#   with no scheduling. Two populations share this class, and the
+#   class claims nothing about the second one:
+#   - handlers proven to touch only script-owned state and module
+#     constants: get_script_info, drain_passive_events,
+#     refresh_browser_cache;
+#   - handlers that read the LOM on the calling thread - the
+#     upstream dispatcher's long-standing shape, preserved exactly.
+#     Their off-thread safety is NOT proven (LOM thread-safety cannot
+#     be established from this code), and MCP-10 neither moves nor
+#     reclassifies them.
+#   get_browser_categories / get_browser_items name handlers that do
+#   not exist; their branches raise before any state is touched, and
+#   that behaviour is likewise preserved.
+#
+# SCRIPT_CAPABILITIES is derived from this table, in table order -
+# keep the entries sorted, so the advertised list stays byte-identical
+# to the historical hand-maintained one. A fork test derives the
+# dispatcher's command set from this file's AST and pins the table to
+# it, so the handshake can never again advertise a subset of what the
+# script implements (it once advertised 19 of 37 commands); a second
+# test pins the table's classes against observed dispatch behaviour,
+# so class and dispatch cannot drift apart either.
+THREAD_MAIN = "main"
+THREAD_HANDLER = "handler"
+
+COMMAND_TABLE = (
+    ("add_notes_to_clip", THREAD_MAIN),
+    ("clear_notes_from_clip", THREAD_MAIN),
+    ("create_audio_clip", THREAD_MAIN),
+    ("create_audio_track", THREAD_MAIN),
+    ("create_clip", THREAD_MAIN),
+    ("create_locator", THREAD_MAIN),
+    ("create_midi_track", THREAD_MAIN),
+    ("delete_clip", THREAD_MAIN),
+    ("drain_passive_events", THREAD_HANDLER),
+    ("duplicate_session_clip_to_arrangement", THREAD_MAIN),
+    ("execute_batch", THREAD_MAIN),
+    ("fire_clip", THREAD_MAIN),
+    ("get_arrangement_clips", THREAD_HANDLER),
+    ("get_browser_categories", THREAD_HANDLER),
+    ("get_browser_item", THREAD_HANDLER),
+    ("get_browser_items", THREAD_HANDLER),
+    ("get_browser_items_at_path", THREAD_HANDLER),
+    ("get_browser_tree", THREAD_HANDLER),
+    ("get_clip_notes", THREAD_HANDLER),
+    ("get_device_parameters", THREAD_HANDLER),
+    ("get_script_info", THREAD_HANDLER),
+    ("get_session_info", THREAD_HANDLER),
+    ("get_session_snapshot", THREAD_HANDLER),
+    ("get_track_info", THREAD_HANDLER),
+    ("inspect_rack", THREAD_MAIN),
+    ("load_browser_item", THREAD_MAIN),
+    ("load_instrument_or_effect", THREAD_MAIN),
+    ("map_rack_magnitude", THREAD_MAIN),
+    ("refresh_browser_cache", THREAD_HANDLER),
+    ("search_browser", THREAD_HANDLER),
+    ("set_arrangement_clip_name", THREAD_MAIN),
+    ("set_clip_name", THREAD_MAIN),
+    ("set_current_song_time", THREAD_MAIN),
+    ("set_device_parameter", THREAD_MAIN),
+    ("set_device_parameters", THREAD_MAIN),
+    ("set_passive_listeners", THREAD_MAIN),
+    ("set_tempo", THREAD_MAIN),
+    ("set_track_name", THREAD_MAIN),
+    ("start_playback", THREAD_MAIN),
+    ("stop_clip", THREAD_MAIN),
+    ("stop_playback", THREAD_MAIN),
+    ("switch_to_arrangement_view", THREAD_MAIN),
+)
+
+SCRIPT_CAPABILITIES = [name for name, _thread_class in COMMAND_TABLE]
+
+# Thread class by command name, derived from the table.
+COMMAND_THREAD_CLASS = dict(COMMAND_TABLE)
+
+# "main" commands discharged by a dedicated branch of _process_command
+# instead of the shared scheduled branch below: execute_batch and
+# set_device_parameters schedule their own single main-thread task;
+# set_device_parameter and set_passive_listeners have their own
+# response-queue blocks. Batch rule (MCP-10): a batch is always ONE
+# main-thread task, even when every item in it is "handler" class -
+# batches are never split by item class.
+_BESPOKE_MAIN_THREAD_COMMANDS = frozenset([
     "execute_batch",
-    "fire_clip",
-    "get_arrangement_clips",
-    "get_browser_categories",
-    "get_browser_item",
-    "get_browser_items",
-    "get_browser_items_at_path",
-    "get_browser_tree",
-    "get_clip_notes",
-    "get_device_parameters",
-    "get_script_info",
-    "get_session_info",
-    "get_session_snapshot",
-    "get_track_info",
-    "inspect_rack",
-    "load_browser_item",
-    "load_instrument_or_effect",
-    "map_rack_magnitude",
-    "refresh_browser_cache",
-    "search_browser",
-    "set_arrangement_clip_name",
-    "set_clip_name",
-    "set_current_song_time",
     "set_device_parameter",
     "set_device_parameters",
     "set_passive_listeners",
-    "set_tempo",
-    "set_track_name",
-    "start_playback",
-    "stop_clip",
-    "stop_playback",
-    "switch_to_arrangement_view",
-]
+])
+
+# Membership of the shared scheduled branch of _process_command,
+# derived from the table - never written out as a literal again.
+_SCHEDULED_GROUP_COMMANDS = frozenset(
+    name for name, thread_class in COMMAND_TABLE
+    if thread_class == THREAD_MAIN) - _BESPOKE_MAIN_THREAD_COMMANDS
 
 # MCP-01 native timing: largest request id the wire's JSON consumers can
 # represent exactly (2**53 - 1).
@@ -664,20 +725,10 @@ class AbletonMCP(ControlSurface):
                         info_kwargs[key] = params[key]
                 response["result"] = self._get_track_info(
                     track_index, **info_kwargs)
-            # Commands that modify Live's state should be scheduled on the main thread
-            elif command_type in ["create_midi_track", "create_audio_track", "set_track_name",
-                                 "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
-                                 "set_arrangement_clip_name",
-                                 "delete_clip",
-                                 "clear_notes_from_clip",
-                                 "set_tempo", "fire_clip", "stop_clip",
-                                 "start_playback", "stop_playback",
-                                 "load_browser_item", "load_instrument_or_effect",
-                                 # Arrangement view – must run on the main thread
-                                 "switch_to_arrangement_view", "set_current_song_time",
-                                 "duplicate_session_clip_to_arrangement",
-                                 "map_rack_magnitude", "inspect_rack",
-                                 "create_locator"]:
+            # "main"-class commands (COMMAND_TABLE) share this
+            # scheduled branch; the bespoke "main" branches
+            # (set_device_parameter, set_passive_listeners) sit below.
+            elif command_type in _SCHEDULED_GROUP_COMMANDS:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -2081,15 +2132,34 @@ class AbletonMCP(ControlSurface):
             value = cache[key]
         except KeyError:
             return None
-        cache.move_to_end(key)
+        # MCP-10: a concurrent client thread can clear or evict the
+        # entry between the lookup and this touch (a load or a
+        # refresh arriving on another connection). The touch is
+        # best-effort: the value was read while the entry existed, so
+        # the hit stands, and a vanished entry must not turn the
+        # lookup into an exception.
+        try:
+            cache.move_to_end(key)
+        except KeyError:
+            pass
         return value
 
     @staticmethod
     def _browser_cache_put(cache, key, value, max_entries):
         cache[key] = value
-        cache.move_to_end(key)
+        # MCP-10: the same clear/evict race as _browser_cache_get -
+        # if the entry vanished between the store and the touch, the
+        # concurrent clear wins (as if this put had completed just
+        # before it) and the eviction loop has nothing to do.
+        try:
+            cache.move_to_end(key)
+        except KeyError:
+            return
         while len(cache) > max_entries:
-            cache.popitem(last=False)
+            try:
+                cache.popitem(last=False)
+            except KeyError:
+                break
 
     def _invalidate_browser_caches(self):
         """Drop every cached browser read and URI resolution."""

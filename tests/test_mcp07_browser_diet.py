@@ -529,7 +529,7 @@ def test_search_works_inside_execute_batch():
 
 
 def test_new_commands_advertised_at_bumped_version():
-    assert script_module.SCRIPT_VERSION == "1.7.8"
+    assert script_module.SCRIPT_VERSION == "1.7.9"
     for name in ("search_browser", "refresh_browser_cache"):
         assert name in script_module.SCRIPT_CAPABILITIES
     counter = WalkCounter()

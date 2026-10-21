@@ -31,6 +31,12 @@ before/after table produced by this script:
      B6 replays simulated response gaps against the per-command
      timeout budgets (MCP-09): gaps beyond the old v1 receive path's
      hard 15 s override, inside the budgets the commands carry.
+     B7 prices one main-thread scheduling on the script side
+     (MCP-10): a handler-class command beside a main-class
+     command through a fake scheduler, inline and with a
+     modelled 1 ms servicing delay. Live's real servicing
+     wait is not measurable headlessly (audit section 2.4);
+     no row claims it.
 
   C. Snapshot serialisation model. Builds the audit's synthetic
      field-for-field snapshot shape (per track: 2 devices x 20
@@ -1422,6 +1428,87 @@ def bench_timeout_budgets():
     return rows
 
 
+# --------------------------------------------------------------------------
+# B7. Dispatch scheduling cost (MCP-10)
+# --------------------------------------------------------------------------
+
+def bench_dispatch_scheduling():
+    """B7 (MCP-10): the script-side cost of one main-thread scheduling.
+
+    The MCP-10 audit classified all 42 dispatcher commands from
+    their handlers: 27 "main" class (the handler touches the LOM, so
+    the command pays one schedule_message hop) and 15 "handler" class
+    (run on the calling thread). No scheduled command proved
+    LOM-free, so none moved; what this section measures is what the
+    hop itself costs on the script side - queue creation, the
+    closure, the queue wake-up - under a FAKE scheduler that runs
+    the task inline. The delayed row adds a modelled 1 ms servicing
+    delay to show where Live's wait would enter the total; Live's
+    real servicing wait depends on the main thread's load and is
+    not measurable headlessly (audit section 2.4), and no row here
+    claims it.
+    """
+    mod = _load_remote_script_module()
+    rows = []
+
+    def make_instance(schedule_message):
+        inst = mod.AbletonMCP.__new__(mod.AbletonMCP)
+        inst.log_message = lambda *a, **k: None
+        inst.show_message = lambda *a, **k: None
+        inst.schedule_message = schedule_message
+        return inst
+
+    reps = 200
+
+    inst = make_instance(lambda delay, fn: fn())
+    ms = _median_ms(
+        lambda: inst._process_command(
+            {"type": "get_script_info", "params": {}}), reps)
+    rows.append({"scenario": "get_script_info dispatch (handler class)",
+                 "thread_class": "handler", "schedule_hops": 0,
+                 "median_wall_ms": ms})
+
+    hops = {"n": 0}
+
+    def inline_scheduler(delay, fn):
+        hops["n"] += 1
+        fn()
+
+    inst = make_instance(inline_scheduler)
+    inst._set_tempo = lambda tempo: {"tempo": tempo}
+    ms = _median_ms(
+        lambda: inst._process_command(
+            {"type": "set_tempo", "params": {"tempo": 120.0}}), reps)
+    rows.append({"scenario": "set_tempo dispatch, fake scheduler inline",
+                 "thread_class": "main",
+                 "schedule_hops": hops["n"] // reps,
+                 "median_wall_ms": ms})
+
+    def delayed_scheduler(delay, fn):
+        time.sleep(0.001)  # modelled servicing delay - NOT a Live figure
+        fn()
+
+    inst = make_instance(delayed_scheduler)
+    inst._set_tempo = lambda tempo: {"tempo": tempo}
+    ms = _median_ms(
+        lambda: inst._process_command(
+            {"type": "set_tempo", "params": {"tempo": 120.0}}), 25)
+    rows.append({"scenario": "set_tempo dispatch, +1 ms modelled delay",
+                 "thread_class": "main", "schedule_hops": 1,
+                 "median_wall_ms": ms})
+
+    hops["n"] = 0
+    inst = make_instance(inline_scheduler)
+    batch = {"type": "execute_batch", "params": {"commands": [
+        {"type": "get_script_info", "params": {}} for _ in range(8)]}}
+    ms = _median_ms(lambda: inst._process_command(batch), reps)
+    rows.append({"scenario": "execute_batch x8 handler items, inline",
+                 "thread_class": "main",
+                 "schedule_hops": hops["n"] // reps,
+                 "median_wall_ms": ms})
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", action="store_true",
@@ -1444,6 +1531,7 @@ def main(argv=None):
     results["browser_browse"] = bench_browser_browse()
     results["passive_listeners"] = bench_passive_listeners()
     results["timeout_budgets"] = bench_timeout_budgets()
+    results["dispatch_scheduling"] = bench_dispatch_scheduling()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
     results["projected_snapshots"] = bench_projected_snapshots()
@@ -1527,6 +1615,17 @@ def main(argv=None):
         print("  %-52s %7s %9.0f %7.0f  %s" % (
             r["scenario"], r["framing"], r["budget_s"],
             r["simulated_gap_s"], r["outcome"]))
+    print()
+
+    print("B7. Dispatch scheduling (MCP-10; fake scheduler - Live's")
+    print("    main-thread servicing wait is not measurable headlessly;")
+    print("    the 1 ms row is a modelled delay, not a Live figure):")
+    print("  %-52s %9s %6s %12s" % ("scenario", "class", "hops",
+                                   "median ms"))
+    for r in results["dispatch_scheduling"]:
+        print("  %-52s %9s %6d %12.3f" % (
+            r["scenario"], r["thread_class"], r["schedule_hops"],
+            r["median_wall_ms"]))
     print()
 
     print("C. Snapshot serialisation model (synthetic, audit 4.5 shape):")
