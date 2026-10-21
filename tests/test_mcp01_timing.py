@@ -93,7 +93,7 @@ def _dispatcher_commands():
 
 def test_capabilities_are_the_complete_dispatcher_surface(script_module):
     derived = _dispatcher_commands()
-    assert len(derived) == 38
+    assert len(derived) == 39  # 37 base + execute_batch + set_device_parameters
     assert set(script_module.SCRIPT_CAPABILITIES) == derived
     assert script_module.SCRIPT_CAPABILITIES == sorted(derived)
 
@@ -101,9 +101,9 @@ def test_capabilities_are_the_complete_dispatcher_surface(script_module):
 def test_handshake_advertises_complete_capabilities_and_markers(script_module):
     info = make_instance(script_module)._get_script_info()
     assert info["protocol_version"] == 1
-    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.5"
+    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.6"
     assert info["capabilities"] == script_module.SCRIPT_CAPABILITIES
-    assert len(info["capabilities"]) == 38
+    assert len(info["capabilities"]) == 39
     assert info["agent0_request_ids"] is True
     assert info["agent0_capabilities_complete"] is True
     assert info["agent0_host_revision"] == 1

@@ -8,6 +8,7 @@ from typing import Any
 _TOOL_LEVELS: dict[str, tuple[int, str]] = {
     "set_tempo": (1, "adjust_tempo"),
     "set_device_parameter": (1, "adjust_parameter"),
+    "set_device_parameters": (1, "adjust_parameter"),
     "set_track_name": (1, "rename_track"),
     "set_clip_name": (1, "rename_clip"),
     "set_arrangement_clip_name": (1, "rename_clip"),

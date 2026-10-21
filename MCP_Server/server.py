@@ -305,6 +305,7 @@ class AbletonConnection:
             "delete_clip",
             "clear_notes_from_clip",
             "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
+            "set_device_parameters",
             "start_playback", "stop_playback", "load_instrument_or_effect",
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
@@ -786,6 +787,8 @@ def get_device_parameters(
     ctx: Context,
     track_index: int,
     device_index: int,
+    parameter_indices: Optional[List[int]] = None,
+    parameter_names: Optional[List[str]] = None,
     user_prompt: str = "",
 ) -> str:
     """
@@ -794,14 +797,24 @@ def get_device_parameters(
     Parameters:
     - track_index: Track that owns the device
     - device_index: Index into the track's device chain
+    - parameter_indices: Optional subset - return only the parameters
+      with these indices (default: all parameters)
+    - parameter_names: Optional subset - return only the parameters
+      with these names; combined with parameter_indices as a union
+      (default: all parameters)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "get_device_parameters",
-            {"track_index": track_index, "device_index": device_index},
-        )
+        params: Dict[str, Any] = {
+            "track_index": track_index, "device_index": device_index}
+        # MCP-06 subset: forward only the selectors the caller actually
+        # set, so a default call sends exactly the pre-subset params.
+        if parameter_indices is not None:
+            params["parameter_indices"] = parameter_indices
+        if parameter_names is not None:
+            params["parameter_names"] = parameter_names
+        result = ableton.send_command("get_device_parameters", params)
         return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting device parameters: {str(e)}")
@@ -849,6 +862,57 @@ def set_device_parameter(
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
         return f"Error setting device parameter: {str(e)}"
+
+
+@mcp.tool()
+@rich_telemetry_tool("set_device_parameters")
+@trajectory_tool("set_device_parameters")
+def set_device_parameters(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    parameters: List[Dict[str, Any]],
+    stop_on_error: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set several parameters on ONE device in a single call.
+
+    Every item is applied with exactly set_device_parameter's
+    semantics and reported individually in the result (old and new
+    values per item); one bad item does not block the others unless
+    stop_on_error is set. An item that never reaches the set
+    (malformed, unaddressable, unknown name) reports a batch-style
+    per-item error instead: the same message a direct call would
+    produce, without the dispatched call's "result": {} key; items
+    that reach the set return the direct call's envelope exactly.
+    This is not a transaction: items apply in
+    order and a failed item does not roll back the ones before it.
+
+    Parameters:
+    - track_index: Track that owns the device
+    - device_index: Index into the track's device chain
+    - parameters: List of {"parameter_index": int, "value": float}
+      items; an item may carry "name" instead of "parameter_index" to
+      address a parameter by name (parameter_index wins if both given)
+    - stop_on_error: Report items after the first failure as skipped
+      instead of applying them (default False)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        ableton = get_ableton_connection()
+        params: Dict[str, Any] = {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameters": parameters,
+        }
+        if stop_on_error:
+            params["stop_on_error"] = True
+        result = ableton.send_command("set_device_parameters", params)
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error setting device parameters: {str(e)}")
+        return f"Error setting device parameters: {str(e)}"
 
 
 @mcp.tool()

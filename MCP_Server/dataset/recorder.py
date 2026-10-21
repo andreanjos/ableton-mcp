@@ -57,6 +57,7 @@ _IMPLICIT_TRACKED_TOOLS = frozenset({
     "load_drum_kit",
     "duplicate_to_arrangement",
     "set_device_parameter",
+    "set_device_parameters",
 })
 
 # An edit undone within this many seconds reads as a rejection

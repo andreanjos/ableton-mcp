@@ -23,6 +23,11 @@ before/after table produced by this script:
      B2 replays the eight-track build against the *real* Remote Script
      dispatcher (stub handlers, real socket): once sequentially, once
      as a single execute_batch (MCP-02) - 42 round trips become 1.
+     B3 replays the parameter tune (audit 4.4c) against the real
+     dispatcher over a fake song: today's shape (one full-device read
+     plus eight set_device_parameter calls - 9 wire requests) beside
+     MCP-06's (one subset read plus one set_device_parameters call -
+     2 wire requests), reporting wire requests and result bytes.
 
   C. Snapshot serialisation model. Builds the audit's synthetic
      field-for-field snapshot shape (per track: 2 devices x 20
@@ -462,6 +467,147 @@ def bench_batch_round_trips():
 
 
 # --------------------------------------------------------------------------
+# B3. The parameter tune: sequential sets vs bulk set (MCP-06)
+# --------------------------------------------------------------------------
+
+class TunePeer:
+    """A real Remote Script instance with a fake song, over a real socket.
+
+    Unlike ScriptPeer (B2) nothing is stubbed: the device-parameter
+    handlers run for real against the section-C2 fake object model, so
+    the tune pays the real serialisation both ways. Top-level wire
+    requests are counted by recursion depth, as in ScriptPeer.
+    """
+
+    def __init__(self, module):
+        inst = module.AbletonMCP.__new__(module.AbletonMCP)
+        inst.log_message = lambda *a, **k: None
+        inst.show_message = lambda *a, **k: None
+        inst.schedule_message = lambda delay, fn: fn()
+        inst.running = True
+        inst._song = _FakeSong(1)
+        self.inst = inst
+        self.requests = 0
+        self.connections = 0
+        self._depth = 0
+        original = inst._process_command
+
+        def counting(command):
+            if self._depth == 0:
+                self.requests += 1
+            self._depth += 1
+            try:
+                return original(command)
+            finally:
+                self._depth -= 1
+        inst._process_command = counting
+
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._thread = threading.Thread(target=self._accept_loop,
+                                        daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self):
+        while True:
+            try:
+                client, _ = self._srv.accept()
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self.inst._handle_client,
+                             args=(client,), daemon=True).start()
+
+    def close(self):
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+
+
+def bench_bulk_tune():
+    """Read-then-tune 8 parameters on one device, both shapes.
+
+    Today's shape replays audit 4.4c exactly: one full
+    get_device_parameters read, then one scheduled set_device_parameter
+    per parameter - 9 wire requests. The MCP-06 shape reads only the 8
+    parameters it is about to tune (subset by name) and applies all 8
+    writes as one set_device_parameters call - 2 wire requests. Result
+    bytes are the JSON sizes of the unwrapped results the client
+    receives, which is what the MCP layer then re-encodes.
+    """
+    from MCP_Server.server import AbletonConnection
+    module = _load_remote_script_module()
+    tune_indices = list(range(2, 10))
+    tune_names = ["Param %d" % i for i in tune_indices]
+    tune_values = [0.11 + 0.01 * i for i in range(8)]
+    rows = []
+
+    peer = TunePeer(module)
+    try:
+        conn = AbletonConnection("127.0.0.1", peer.port)
+        start = time.perf_counter()
+        result_bytes = 0
+        read = conn.send_command(
+            "get_device_parameters", {"track_index": 0, "device_index": 0})
+        result_bytes += len(json.dumps(read).encode("utf-8"))
+        applied = 0
+        for index, value in zip(tune_indices, tune_values):
+            result = conn.send_command(
+                "set_device_parameter",
+                {"track_index": 0, "device_index": 0,
+                 "parameter_index": index, "value": value})
+            result_bytes += len(json.dumps(result).encode("utf-8"))
+            applied += 1
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        conn.disconnect()
+        rows.append({
+            "workflow": "parameter tune, full read + 8 single sets",
+            "wire_requests": peer.requests,
+            "result_bytes": result_bytes,
+            "connections": peer.connections,
+            "sets_applied": applied,
+            "wall_ms": wall_ms,
+        })
+    finally:
+        peer.close()
+
+    peer = TunePeer(module)
+    try:
+        conn = AbletonConnection("127.0.0.1", peer.port)
+        start = time.perf_counter()
+        result_bytes = 0
+        read = conn.send_command(
+            "get_device_parameters",
+            {"track_index": 0, "device_index": 0,
+             "parameter_names": tune_names})
+        result_bytes += len(json.dumps(read).encode("utf-8"))
+        result = conn.send_command(
+            "set_device_parameters",
+            {"track_index": 0, "device_index": 0,
+             "parameters": [{"parameter_index": index, "value": value}
+                            for index, value in
+                            zip(tune_indices, tune_values)]})
+        result_bytes += len(json.dumps(result).encode("utf-8"))
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        conn.disconnect()
+        rows.append({
+            "workflow": "parameter tune, subset read + 1 bulk set (MCP-06)",
+            "wire_requests": peer.requests,
+            "result_bytes": result_bytes,
+            "connections": peer.connections,
+            "sets_applied": result["summary"]["succeeded"],
+            "wall_ms": wall_ms,
+        })
+    finally:
+        peer.close()
+    return rows
+
+
+# --------------------------------------------------------------------------
 # C. Snapshot serialisation model (synthetic; audit 4.5 shape)
 # --------------------------------------------------------------------------
 
@@ -730,6 +876,7 @@ def main(argv=None):
     rows, timing_captured = bench_round_trips()
     results["round_trips"] = rows
     results["batch_round_trips"] = bench_batch_round_trips()
+    results["bulk_tune"] = bench_bulk_tune()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
     results["projected_snapshots"] = bench_projected_snapshots()
@@ -772,6 +919,18 @@ def main(argv=None):
     batch_row = results["batch_round_trips"][-1]
     print("  batch items executed: %d, item failures: %d"
           % (batch_row["items"], batch_row["item_failures"]))
+    print()
+
+    print("B3. Parameter tune against the real Remote Script dispatcher:")
+    print("  %-42s %13s %13s %12s %10s" % ("workflow", "wire requests",
+                                          "result bytes", "connections",
+                                          "wall ms"))
+    for r in results["bulk_tune"]:
+        print("  %-42s %13d %13d %12d %10.1f" % (
+            r["workflow"], r["wire_requests"], r["result_bytes"],
+            r["connections"], r["wall_ms"]))
+    print("  sets applied per row: %s" % ", ".join(
+        str(r["sets_applied"]) for r in results["bulk_tune"]))
     print()
 
     print("C. Snapshot serialisation model (synthetic, audit 4.5 shape):")

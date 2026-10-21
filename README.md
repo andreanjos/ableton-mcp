@@ -388,6 +388,48 @@ asking for one track brings back about 31 KB at any set size. Requires
 Remote Script 1.7.5+ for the projection to take effect; older scripts
 ignore the new params and return the full result, as before.
 
+### Bulk device parameters
+
+Reading and tuning one device used to cost 1 + N round trips: a full
+`get_device_parameters` read, then one main-thread-scheduled
+`set_device_parameter` call per parameter. Two opt-in forms collapse
+that (Remote Script 1.7.6+):
+
+- **Subset reads.** `get_device_parameters` accepts optional
+  `parameter_indices` and/or `parameter_names`. When either is given,
+  every `parameters` list in the result (the device's own, and any
+  devices nested in its chains) keeps only the entries whose index or
+  name was requested - the union when both are given - with the
+  per-entry shape unchanged. With neither given the read is exactly
+  the pre-subset one; older scripts ignore the new params and return
+  the full read. The `get_device_parameters` MCP tool exposes the same
+  selectors and forwards only the ones a caller set.
+- **Bulk set.** `set_device_parameters` takes `track_index`,
+  `device_index` and a `parameters` list of
+  `{"parameter_index": i, "value": v}` items - an item may carry
+  `"name"` instead of `"parameter_index"` to address a parameter by
+  name (`parameter_index` wins when both are given) - and applies the
+  whole list inside ONE main-thread scheduling. Each item goes
+  through the single set itself, so clamping, value conversion and
+  errors are the single set's, item for item, and each item that
+  reaches the set reports the envelope a direct
+  `set_device_parameter` call would have produced (old/new values
+  included). An item that never reaches the set (malformed,
+  unaddressable, unknown name) reports a batch-style per-item error
+  instead: the same message a direct call would produce, without
+  the dispatched call's `"result": {}` key. One bad item does not block the
+  others; an optional `stop_on_error` reports the remaining items as
+  skipped instead. The result is `{"results": [...], "summary":
+  {"total", "succeeded", "failed", "skipped"}}`, mirroring
+  `execute_batch`.
+
+`set_device_parameters` is **not a transaction**: items apply in
+order and a failed item does not roll back the items before it.
+
+Measured with the benchmark below (real dispatcher, fake song): the
+8-parameter tune drops from 9 wire requests and 4,527 result bytes to
+2 wire requests and 2,936 result bytes.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
