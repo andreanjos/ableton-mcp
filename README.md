@@ -304,6 +304,29 @@ From Python, `AbletonConnection.send_command(type, params, request_id=n)`
 attaches an id, verifies the echo, and exposes the timing block as
 `connection.last_timing`.
 
+### Batch execution (execute_batch)
+
+`execute_batch` runs an ordered list of commands in one socket round
+trip and one main-thread scheduling - the fix for composite work that
+otherwise costs one exchange (and one main-thread queue wait) per
+command. The request params are `{"commands": [{"type": ...,
+"params": {...}}, ...], "stop_on_error": false}`. The result is
+`{"results": [...], "summary": {"total": n, "succeeded": n, "failed":
+n, "skipped": n}}`, where each entry of `results` is exactly the
+response envelope a direct call of that command would have produced.
+With `"stop_on_error": true`, items after the first failure are not
+run and are reported as `{"status": "skipped", ...}` - never silently
+dropped. A batch inside a batch is rejected as a per-item error.
+
+Batching is a sequencing primitive, **not a transaction**: items
+execute in order and a failed item does not roll back the items
+before it. From Python, `AbletonConnection.send_batch([{"type": ...,
+"params": {...}}, ...])` performs the exchange and returns the batch
+result; per-item failures are reported in `results`, not raised.
+Requires Remote Script 1.7.3+ (the handshake capabilities advertise
+`execute_batch`). The timing opt-in above applies to the batch as a
+whole and, per item, to each item's own envelope.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)

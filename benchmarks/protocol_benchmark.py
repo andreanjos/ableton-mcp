@@ -17,6 +17,9 @@ before/after table produced by this script:
      ``AbletonConnection`` replays the command sequences the audit
      counted in section 4.4 of the lane audit. The point of the table is
      the counts (connections must stay 1), not the fake-peer latency.
+     B2 replays the eight-track build against the *real* Remote Script
+     dispatcher (stub handlers, real socket): once sequentially, once
+     as a single execute_batch (MCP-02) - 42 round trips become 1.
 
   C. Snapshot serialisation model. Builds the audit's synthetic
      field-for-field snapshot shape (per track: 2 devices x 20
@@ -311,6 +314,124 @@ def bench_round_trips():
 
 
 # --------------------------------------------------------------------------
+# B2. The eight-track build as one execute_batch (MCP-02)
+# --------------------------------------------------------------------------
+
+class ScriptPeer:
+    """A real Remote Script instance behind a real TCP socket.
+
+    The batch scenario must execute in the fork's own dispatcher, not
+    in a canned responder, so this peer serves the actual AbletonMCP
+    class (loaded with _Framework stubbed). The handful of handlers
+    the eight-track workflow touches are stubbed - their Live work is
+    not the measurement; the request count is. Top-level requests are
+    counted by recursion depth, because batch items call the same
+    _process_command as wire commands do.
+    """
+
+    def __init__(self, module):
+        inst = module.AbletonMCP.__new__(module.AbletonMCP)
+        inst.log_message = lambda *a, **k: None
+        inst.show_message = lambda *a, **k: None
+        inst.schedule_message = lambda delay, fn: fn()
+        inst.running = True
+        inst._get_session_info = lambda: {}
+        inst._get_session_snapshot = (
+            lambda include_notes=True, include_params=True: {})
+        inst._get_track_info = lambda track_index: {}
+        inst._create_midi_track = lambda index: {}
+        inst._set_track_name = lambda track_index, name: {}
+        inst._load_browser_item = lambda track_index, item_uri: {}
+        self.inst = inst
+        self.requests = 0
+        self.connections = 0
+        self._depth = 0
+        original = inst._process_command
+
+        def counting(command):
+            if self._depth == 0:
+                self.requests += 1
+            self._depth += 1
+            try:
+                return original(command)
+            finally:
+                self._depth -= 1
+        inst._process_command = counting
+
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(5)
+        self.port = self._srv.getsockname()[1]
+        self._thread = threading.Thread(target=self._accept_loop,
+                                        daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self):
+        while True:
+            try:
+                client, _ = self._srv.accept()
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self.inst._handle_client,
+                             args=(client,), daemon=True).start()
+
+    def close(self):
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+
+
+def bench_batch_round_trips():
+    """The audit's 42-command eight-track build, sequential vs batched.
+
+    Both runs replay the same command list through the real Remote
+    Script dispatcher over a real AbletonConnection: first one
+    send_command per command, then one send_batch for all of them.
+    """
+    from MCP_Server.server import AbletonConnection
+    peer = ScriptPeer(_load_remote_script_module())
+    rows = []
+    try:
+        commands = WORKFLOWS["direct eight-track build (audit 4.4b)"]
+        before_requests, before_conns = peer.requests, peer.connections
+        conn = AbletonConnection("127.0.0.1", peer.port)
+        start = time.perf_counter()
+        for command_type in commands:
+            conn.send_command(command_type, {})
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        conn.disconnect()
+        rows.append({
+            "workflow": "eight-track build, sequential (real script)",
+            "commands": len(commands),
+            "round_trips": peer.requests - before_requests,
+            "connections": peer.connections - before_conns,
+            "wall_ms": wall_ms,
+        })
+        before_requests, before_conns = peer.requests, peer.connections
+        conn = AbletonConnection("127.0.0.1", peer.port)
+        start = time.perf_counter()
+        result = conn.send_batch(
+            [{"type": t, "params": {}} for t in commands])
+        wall_ms = (time.perf_counter() - start) * 1000.0
+        conn.disconnect()
+        rows.append({
+            "workflow": "eight-track build, one execute_batch (MCP-02)",
+            "commands": len(commands),
+            "round_trips": peer.requests - before_requests,
+            "connections": peer.connections - before_conns,
+            "wall_ms": wall_ms,
+            "items": result["summary"]["total"],
+            "item_failures": result["summary"]["failed"],
+        })
+    finally:
+        peer.close()
+    return rows
+
+
+# --------------------------------------------------------------------------
 # C. Snapshot serialisation model (synthetic; audit 4.5 shape)
 # --------------------------------------------------------------------------
 
@@ -408,6 +529,7 @@ def main(argv=None):
     }
     rows, timing_captured = bench_round_trips()
     results["round_trips"] = rows
+    results["batch_round_trips"] = bench_batch_round_trips()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
 
@@ -434,6 +556,20 @@ def main(argv=None):
             r["connections"], r["wall_ms"]))
     print("  request_id opt-in: agent0_timing captured by the server: %s"
           % ("yes" if timing_captured else "NO"))
+    print()
+
+    print("B2. Eight-track build against the real Remote Script "
+          "dispatcher:")
+    print("  %-42s %9s %12s %12s %10s" % ("workflow", "commands",
+                                          "round trips", "connections",
+                                          "wall ms"))
+    for r in results["batch_round_trips"]:
+        print("  %-42s %9d %12d %12d %10.1f" % (
+            r["workflow"], r["commands"], r["round_trips"],
+            r["connections"], r["wall_ms"]))
+    batch_row = results["batch_round_trips"][-1]
+    print("  batch items executed: %d, item failures: %d"
+          % (batch_row["items"], batch_row["item_failures"]))
     print()
 
     print("C. Snapshot serialisation model (synthetic, audit 4.5 shape):")

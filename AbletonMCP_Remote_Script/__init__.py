@@ -34,7 +34,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.2"
+SCRIPT_VERSION = "1.7.3"
 PROTOCOL_VERSION = 1
 
 # Complete command surface of the _process_command dispatcher, kept sorted.
@@ -52,6 +52,7 @@ SCRIPT_CAPABILITIES = [
     "delete_clip",
     "drain_passive_events",
     "duplicate_session_clip_to_arrangement",
+    "execute_batch",
     "fire_clip",
     "get_arrangement_clips",
     "get_browser_categories",
@@ -84,6 +85,11 @@ SCRIPT_CAPABILITIES = [
 # MCP-01 native timing: largest request id the wire's JSON consumers can
 # represent exactly (2**53 - 1).
 MAX_REQUEST_ID = 9007199254740991
+
+# MCP-02: largest command list execute_batch will run in one scheduling.
+# A batch holds Live's main thread for its whole duration, so the list is
+# capped far below what the 16 MiB request ceiling alone would allow.
+MAX_BATCH_COMMANDS = 1000
 
 
 def _is_valid_request_id(value):
@@ -135,6 +141,12 @@ class AbletonMCP(ControlSurface):
         self.client_threads = []
         self.server_thread = None
         self.running = False
+
+        # Per-thread dispatch state (MCP-02). An execute_batch task sets
+        # on_main_thread on the thread it runs on - Live's main thread -
+        # so the commands it dispatches run inline instead of each
+        # scheduling their own main-thread hop (see _execute_batch).
+        self._dispatch_state = threading.local()
         
         # Cache the song reference for easier access
         self._song = self.song()
@@ -323,6 +335,18 @@ class AbletonMCP(ControlSurface):
                 pass
             self.log_message("Client handler stopped")
     
+    def _batch_inline_active(self):
+        """True while an execute_batch task is dispatching on this thread.
+
+        The batch task sets this thread-locally for its duration; command
+        dispatch that observes it runs inline instead of scheduling,
+        because the batch already holds the one main-thread scheduling
+        (and a task queued from the main thread could not run until the
+        batch returns anyway).
+        """
+        state = getattr(self, "_dispatch_state", None)
+        return state is not None and getattr(state, "on_main_thread", False)
+
     def _schedule_main_thread_task(self, task, timing_state):
         """Schedule *task* on Live's main thread, optionally timed.
 
@@ -331,26 +355,32 @@ class AbletonMCP(ControlSurface):
         thread). With timing requested, the task is wrapped so queue_ms /
         execution_ms can be reported; the finish stamp is taken just
         after the task returns, i.e. just after it queued its response.
+
+        While an execute_batch task is dispatching on this thread, the
+        task runs inline instead: the batch's single scheduling is the
+        hop for every command it contains.
         """
-        if timing_state is None:
-            try:
-                self.schedule_message(0, task)
-            except AssertionError:
-                # If we're already on the main thread, execute directly
-                task()
+        if timing_state is not None:
+            def timed_task():
+                timing_state["main_started"] = time.perf_counter()
+                try:
+                    task()
+                finally:
+                    timing_state["main_finished"] = time.perf_counter()
+
+            runnable = timed_task
+        else:
+            runnable = task
+
+        if self._batch_inline_active():
+            runnable()
             return
 
-        def timed_task():
-            timing_state["main_started"] = time.perf_counter()
-            try:
-                task()
-            finally:
-                timing_state["main_finished"] = time.perf_counter()
-
         try:
-            self.schedule_message(0, timed_task)
+            self.schedule_message(0, runnable)
         except AssertionError:
-            timed_task()
+            # If we're already on the main thread, execute directly
+            runnable()
 
     def _process_command(self, command):
         """Process a command from the client and return a response"""
@@ -381,6 +411,16 @@ class AbletonMCP(ControlSurface):
             # Route the command to the appropriate handler
             if command_type == "get_script_info":
                 response["result"] = self._get_script_info()
+            elif command_type == "execute_batch":
+                # MCP-02: run the whole command list inside one
+                # main-thread scheduling (see _execute_batch).
+                batch_response = self._execute_batch(params, timing_state)
+                if batch_response.get("status") == "error":
+                    response["status"] = "error"
+                    response["message"] = batch_response.get(
+                        "message", "Batch failed")
+                else:
+                    response["result"] = batch_response.get("result", {})
             elif command_type == "get_session_info":
                 response["result"] = self._get_session_info()
             elif command_type == "get_track_info":
@@ -606,6 +646,135 @@ class AbletonMCP(ControlSurface):
             _finish_agent0_timing(response, timing_state)
         return response
     
+    def _execute_batch(self, params, timing_state=None):
+        """Execute an ordered list of commands in one main-thread task.
+
+        The wire command ``execute_batch`` (MCP-02) takes ``commands``: a
+        list of ``{"type": ..., "params": {...}}`` items, and an optional
+        ``stop_on_error`` (default False). The whole list runs inside ONE
+        schedule_message hop: this method's task executes on Live's main
+        thread and dispatches each item through _process_command with
+        re-scheduling suppressed (see _schedule_main_thread_task), so a
+        batch of N commands costs one socket round trip and one queue
+        wait instead of N of each.
+
+        This is a sequencing primitive, NOT a transaction. Items run in
+        order; each produces exactly the response envelope a direct call
+        would have produced; a failed item does not roll back the items
+        before it. With stop_on_error, items after the first failure are
+        not run and are reported as {"status": "skipped", ...} - never
+        silently dropped. The success result is
+        {"results": [...], "summary": {"total": n, "succeeded": n,
+        "failed": n, "skipped": n}}.
+        """
+        if not isinstance(params, dict):
+            return {"status": "error",
+                    "message": "execute_batch requires an object of params"}
+        commands = params.get("commands")
+        if not isinstance(commands, list):
+            return {"status": "error",
+                    "message": "execute_batch requires a 'commands' list"}
+        if len(commands) > MAX_BATCH_COMMANDS:
+            return {"status": "error",
+                    "message": "execute_batch accepts at most %d commands"
+                               % MAX_BATCH_COMMANDS}
+        stop_on_error = bool(params.get("stop_on_error", False))
+
+        response_queue = queue.Queue()
+
+        def batch_task():
+            results = []
+            succeeded = 0
+            failed = 0
+            skipped = 0
+            try:
+                state = getattr(self, "_dispatch_state", None)
+                if state is None:
+                    state = self._dispatch_state = threading.local()
+                state.on_main_thread = True
+                try:
+                    halted = False
+                    for item in commands:
+                        if halted:
+                            results.append({
+                                "status": "skipped",
+                                "message": "Skipped: stop_on_error after "
+                                           "a failed item",
+                            })
+                            skipped += 1
+                            continue
+                        item_response = self._execute_batch_item(
+                            item, timing_state is not None)
+                        results.append(item_response)
+                        if item_response.get("status") == "error":
+                            failed += 1
+                            if stop_on_error:
+                                halted = True
+                        else:
+                            succeeded += 1
+                finally:
+                    state.on_main_thread = False
+            except Exception as e:
+                self.log_message("Error in batch task: " + str(e))
+                self.log_message(traceback.format_exc())
+                response_queue.put({"status": "error", "message": str(e)})
+                return
+            response_queue.put({"status": "success", "result": {
+                "results": results,
+                "summary": {"total": len(commands),
+                            "succeeded": succeeded,
+                            "failed": failed,
+                            "skipped": skipped},
+            }})
+
+        self._schedule_main_thread_task(batch_task, timing_state)
+
+        # The batch may take as long as its items could have taken one by
+        # one: mirror the per-command queue budgets (60 s for
+        # create_audio_clip, 10 s otherwise), floored at one budget.
+        queue_timeout = 0.0
+        for item in commands:
+            if isinstance(item, dict) and item.get("type") == "create_audio_clip":
+                queue_timeout += 60.0
+            else:
+                queue_timeout += 10.0
+        try:
+            return response_queue.get(timeout=max(queue_timeout, 10.0))
+        except queue.Empty:
+            return {"status": "error",
+                    "message": "Timeout waiting for batch to complete"}
+
+    def _execute_batch_item(self, item, timed):
+        """Dispatch one execute_batch item exactly as a direct call.
+
+        ``timed`` propagates the batch's own timing opt-in: items of a
+        timed batch carry "timing": true, so each per-item envelope gets
+        its own agent0_timing block (dispatch/queue/execution for that
+        item); items of an untimed batch produce envelopes identical to
+        direct calls. Guarded commands keep their guards: a guarded
+        item runs the same handler - and the same checks - as the direct
+        command, because dispatch is the direct path.
+        """
+        if not isinstance(item, dict):
+            return {"status": "error",
+                    "message": "Batch items must be objects with 'type' "
+                               "and 'params'"}
+        item_type = item.get("type", "")
+        if item_type == "execute_batch":
+            # No recursion: a batch inside a batch could not keep the
+            # one-scheduling guarantee, and a flat list sequences the
+            # same work without it.
+            return {"status": "error",
+                    "message": "Nested execute_batch is not allowed"}
+        item_params = item.get("params", {})
+        if not isinstance(item_params, dict):
+            return {"status": "error",
+                    "message": "Batch item 'params' must be an object"}
+        item_command = {"type": item_type, "params": item_params}
+        if timed:
+            item_command["timing"] = True
+        return self._process_command(item_command)
+
     # Command implementations
 
     def _get_script_info(self):
