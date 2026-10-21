@@ -881,7 +881,12 @@ def set_device_parameters(
     Every item is applied with exactly set_device_parameter's
     semantics and reported individually in the result (old and new
     values per item); one bad item does not block the others unless
-    stop_on_error is set. This is not a transaction: items apply in
+    stop_on_error is set. An item that never reaches the set
+    (malformed, unaddressable, unknown name) reports a batch-style
+    per-item error instead: the same message a direct call would
+    produce, without the dispatched call's "result": {} key; items
+    that reach the set return the direct call's envelope exactly.
+    This is not a transaction: items apply in
     order and a failed item does not roll back the ones before it.
 
     Parameters:

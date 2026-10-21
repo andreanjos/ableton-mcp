@@ -411,9 +411,13 @@ that (Remote Script 1.7.6+):
   name (`parameter_index` wins when both are given) - and applies the
   whole list inside ONE main-thread scheduling. Each item goes
   through the single set itself, so clamping, value conversion and
-  errors are the single set's, item for item, and each item's outcome
-  is the envelope a direct `set_device_parameter` call would have
-  produced (old/new values included). One bad item does not block the
+  errors are the single set's, item for item, and each item that
+  reaches the set reports the envelope a direct
+  `set_device_parameter` call would have produced (old/new values
+  included). An item that never reaches the set (malformed,
+  unaddressable, unknown name) reports a batch-style per-item error
+  instead: the same message a direct call would produce, without
+  the dispatched call's `"result": {}` key. One bad item does not block the
   others; an optional `stop_on_error` reports the remaining items as
   skipped instead. The result is `{"results": [...], "summary":
   {"total", "succeeded", "failed", "skipped"}}`, mirroring

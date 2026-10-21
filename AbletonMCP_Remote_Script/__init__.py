@@ -3005,15 +3005,20 @@ class AbletonMCP(ControlSurface):
     def _apply_parameter_item(self, track_index, device_index, item):
         """Apply one set_device_parameters item via the single set.
 
-        The item's outcome is exactly the envelope a direct
-        set_device_parameter call for the same write would produce:
-        the single set's own result on success, its error message on
-        failure. Name resolution is the only pre-step: an item with a
-        ``name`` and no ``parameter_index`` is resolved to that
-        parameter's index, then set by index like any direct call. An
-        item without a usable address is a per-item error, never a
-        silent no-op. A missing ``value`` takes the single set's own
-        dispatcher default (0.0).
+        An item that reaches the set gets exactly the envelope a
+        direct set_device_parameter call for the same write would
+        produce: the single set's own result on success, its error
+        envelope - ``"result": {}`` included - on failure. Name
+        resolution is the only pre-step: an item with a ``name`` and
+        no ``parameter_index`` is resolved to that parameter's index,
+        then set by index like any direct call. An item that never
+        reaches the set (malformed, no usable address, name
+        resolution failing) is a per-item error in the batch style -
+        ``{"status": "error", "message": ...}`` carrying the same
+        message a direct call would produce, without the dispatched
+        call's ``"result": {}`` key - never a silent no-op. A
+        missing ``value`` takes the single set's own dispatcher
+        default (0.0).
         """
         if not isinstance(item, dict):
             return {"status": "error",
@@ -3047,7 +3052,12 @@ class AbletonMCP(ControlSurface):
 
         Raises with the single set's own messages when the track or
         device index is out of range, so a name-addressed item fails
-        exactly as the equivalent direct call would.
+        with the same message the equivalent direct call would
+        produce. The failure surfaces before the set, though, so the
+        item's envelope is the pre-set batch-style per-item error -
+        that message without the ``"result": {}`` key a dispatched
+        direct call carries; only items that reach the set return
+        the direct call's envelope exactly.
         """
         if track_index < 0 or track_index >= len(self._song.tracks):
             raise IndexError("Track index out of range")
