@@ -327,6 +327,30 @@ Requires Remote Script 1.7.3+ (the handshake capabilities advertise
 `execute_batch`). The timing opt-in above applies to the batch as a
 whole and, per item, to each item's own envelope.
 
+### Framing v2 (length-prefixed, negotiated)
+
+Protocol v1 sends each request and response as one raw JSON object and
+finds the message boundary by re-parsing the accumulated buffer after
+every chunk - quadratic in the message size (~61x the one-shot parse
+cost at 1 MiB, ~133x at 2 MiB, measured on both endpoints; see the
+benchmark below). Framing v2 sends the same JSON object as one
+length-prefixed frame - a 4-byte big-endian payload length plus the
+UTF-8 payload, at most the same 16 MiB - decoded incrementally, with a
+native `request_id` in every payload for exact correlation (the
+MCP-01 echo/timing mechanism, not a second one).
+
+Framing is negotiated, never assumed. The Remote Script (1.7.4+)
+advertises `agent0_framing: ["v1", "v2"]` in the `get_script_info`
+handshake; the MCP server switches a connection to framed exchanges
+only after that advertisement, and the script decides each message's
+framing at its boundary and answers in kind - so a session opens with
+the v1 handshake and frames everything after it, while a v1 client
+sees byte-identical v1 behaviour. An oversized or malformed frame is
+answered with a framed error and a closed connection, never a hang.
+From Python nothing changes: `send_command` / `send_batch` frame
+transparently once negotiated, and `last_timing` is populated on
+every v2 exchange.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
