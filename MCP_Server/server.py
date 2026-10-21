@@ -7,7 +7,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List, Union
+from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
 from .framing import FrameDecoder, encode_frame
 
@@ -709,17 +709,34 @@ def get_remote_script_info(ctx: Context, user_prompt: str = "") -> str:
 @mcp.tool()
 @telemetry_tool("get_track_info")
 @trajectory_tool("get_track_info")
-def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+def get_track_info(
+    ctx: Context,
+    track_index: int,
+    include_clip_slots: bool = True,
+    include_devices: bool = True,
+    user_prompt: str = "",
+) -> str:
     """
     Get detailed information about a specific track in Ableton.
 
     Parameters:
     - track_index: The index of the track to get information about
+    - include_clip_slots: Include the clip-slot list (default True;
+      False omits it from the result entirely)
+    - include_devices: Include the device list (default True;
+      False omits it from the result entirely)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_track_info", {"track_index": track_index})
+        params: Dict[str, Any] = {"track_index": track_index}
+        # MCP-05 projection: forward only non-default flags, so a
+        # default call sends exactly the pre-projection params.
+        if not include_clip_slots:
+            params["include_clip_slots"] = False
+        if not include_devices:
+            params["include_devices"] = False
+        result = ableton.send_command("get_track_info", params)
         return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting track info from Ableton: {str(e)}")
@@ -841,6 +858,15 @@ def get_session_snapshot(
     ctx: Context,
     include_notes: bool = True,
     include_params: bool = True,
+    track_indices: Optional[List[int]] = None,
+    include_scenes: bool = True,
+    include_return_tracks: bool = True,
+    include_master_track: bool = True,
+    include_cue_points: bool = True,
+    include_clip_slots: bool = True,
+    include_devices: bool = True,
+    include_arrangement_clips: bool = True,
+    include_automation: Optional[bool] = None,
     user_prompt: str = "",
 ) -> str:
     """
@@ -853,6 +879,16 @@ def get_session_snapshot(
     Parameters:
     - include_notes: Include MIDI note arrays in clips (default True)
     - include_params: Include device parameter values (default True)
+    - track_indices: Restrict the snapshot to these track indices
+      (default: all tracks)
+    - include_scenes / include_return_tracks / include_master_track /
+      include_cue_points: Include that top-level section (default True;
+      False omits it from the result entirely)
+    - include_clip_slots / include_devices / include_arrangement_clips:
+      Include that per-track section (default True; False omits it)
+    - include_automation: Run the automated-parameter scan that feeds
+      the automated_parameters keys on devices (default: follows
+      include_params; set explicitly to override either way)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
@@ -862,13 +898,28 @@ def get_session_snapshot(
         if missing:
             return missing
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "get_session_snapshot",
-            {
-                "include_notes": include_notes,
-                "include_params": include_params,
-            },
-        )
+        params: Dict[str, Any] = {
+            "include_notes": include_notes,
+            "include_params": include_params,
+        }
+        # MCP-05 projection: forward only what the caller actually set,
+        # so a default call sends exactly the pre-projection params.
+        if track_indices is not None:
+            params["track_indices"] = track_indices
+        if include_automation is not None:
+            params["include_automation"] = include_automation
+        for _key, _value in (
+            ("include_scenes", include_scenes),
+            ("include_return_tracks", include_return_tracks),
+            ("include_master_track", include_master_track),
+            ("include_cue_points", include_cue_points),
+            ("include_clip_slots", include_clip_slots),
+            ("include_devices", include_devices),
+            ("include_arrangement_clips", include_arrangement_clips),
+        ):
+            if not _value:
+                params[_key] = False
+        result = ableton.send_command("get_session_snapshot", params)
         return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting session snapshot: {str(e)}")

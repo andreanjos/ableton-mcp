@@ -31,6 +31,10 @@ before/after table produced by this script:
      times for full (notes+params) vs lean snapshots. This is a model
      of the serializer's output shape, not a measured Live set.
 
+  C2. Projected snapshot sizes. Runs the real Remote Script
+     serializer against a fake Live object model at the section-C
+     proportions and reports full vs MCP-05-projected snapshot sizes.
+
 Run from the repo root:
 
     uv run python -m benchmarks.protocol_benchmark [--json]
@@ -522,6 +526,176 @@ def bench_snapshot_model():
     return rows
 
 
+
+# --------------------------------------------------------------------------
+# C2. Projected snapshot sizes (real serializer, fake LOM song; MCP-05)
+# --------------------------------------------------------------------------
+#
+# Section C models the snapshot shape with synthetic dicts. This section
+# instead runs the Remote Script serializer itself against a fake Live
+# object model built to the audit 4.5 proportions (per track: 2 devices
+# x 20 parameters with one automated parameter, 16 session slots with
+# one 64-note clip, one 64-note arrangement clip, 2 sends; plus 2 return
+# tracks, an 8-scene list and 2 cue points), and reports the encoded
+# size of the full snapshot beside each MCP-05 projection.
+
+class _FakeParam(object):
+    def __init__(self, name, value=0.5, automated=False):
+        self.name = name
+        self.value = value
+        self.min = 0.0
+        self.max = 1.0
+        self.is_enabled = True
+        self.is_quantized = False
+        self.value_string = "%.2f" % value
+        self.automation_state = 1 if automated else 0
+
+
+class _FakeDevice(object):
+    def __init__(self, name, param_count=20):
+        self.name = name
+        self.class_name = "PluginDevice"
+        self.class_display_name = "PluginDevice"
+        self.can_have_chains = False
+        self.can_have_drum_pads = False
+        self.parameters = [
+            _FakeParam("Param %d" % i, automated=(i == 0))
+            for i in range(param_count)
+        ]
+
+
+class _FakeNote(object):
+    def __init__(self, pitch, start_time):
+        self.pitch = pitch
+        self.start_time = start_time
+        self.duration = 0.25
+        self.velocity = 100
+        self.mute = False
+
+
+class _FakeClip(object):
+    def __init__(self, name, note_count=64):
+        self.name = name
+        self.length = 16.0
+        self.is_playing = False
+        self.is_recording = False
+        self.is_midi_clip = True
+        self.is_audio_clip = False
+        self.color = 0
+        self.looping = True
+        self.loop_start = 0.0
+        self.loop_end = 16.0
+        self.warping = False
+        self.warp_mode = 0
+        self.gain = 1.0
+        self.pitch_coarse = 0
+        self.pitch_fine = 0
+        self.launch_mode = 0
+        self.start_time = 0.0
+        self.end_time = 16.0
+        self._note_list = [
+            _FakeNote(60 + (i % 12), i * 0.25) for i in range(note_count)]
+
+    def get_notes_extended(self, _from_pitch, _to_pitch, _start, _duration):
+        return list(self._note_list)
+
+
+class _FakeClipSlot(object):
+    def __init__(self, clip=None):
+        self.has_clip = clip is not None
+        self.clip = clip
+
+
+class _FakeMixer(object):
+    def __init__(self, send_count=2):
+        self.volume = _FakeParam("Volume", 0.85)
+        self.panning = _FakeParam("Pan", 0.0)
+        self.sends = [_FakeParam("Send %d" % i, 0.0)
+                      for i in range(send_count)]
+
+
+class _FakeTrack(object):
+    def __init__(self, label, device_count=2, slot_count=16):
+        self.name = label
+        self.has_audio_input = False
+        self.has_midi_input = True
+        self.mute = False
+        self.solo = False
+        self.can_be_armed = True
+        self.arm = False
+        self.mixer_device = _FakeMixer()
+        slots = [_FakeClipSlot() for _ in range(slot_count)]
+        if slot_count:
+            slots[0] = _FakeClipSlot(_FakeClip("Clip " + label))
+        self.clip_slots = slots
+        self.devices = [_FakeDevice("Device %d" % d)
+                        for d in range(device_count)]
+        self.arrangement_clips = [_FakeClip("Arr " + label)]
+
+
+class _FakeScene(object):
+    def __init__(self, index):
+        self.name = "Scene %d" % index
+        self.tempo = 120.0
+        self.is_triggered = False
+
+
+class _FakeCuePoint(object):
+    def __init__(self, name, time):
+        self.name = name
+        self.time = time
+
+
+class _FakeSong(object):
+    def __init__(self, track_count):
+        self.tempo = 120.0
+        self.signature_numerator = 4
+        self.signature_denominator = 4
+        self.tracks = [_FakeTrack("Track %d" % i)
+                       for i in range(track_count)]
+        self.return_tracks = [
+            _FakeTrack("Return %d" % i, device_count=1, slot_count=0)
+            for i in range(2)]
+        self.master_track = _FakeTrack("Master", device_count=1,
+                                       slot_count=0)
+        self.scenes = [_FakeScene(i) for i in range(8)]
+        self.cue_points = [_FakeCuePoint("Intro", 0.0),
+                           _FakeCuePoint("Drop", 32.0)]
+        self.is_playing = False
+        self.current_song_time = 0.0
+        self.song_length = 64.0
+        self.loop = False
+        self.loop_start = 0.0
+        self.loop_length = 0.0
+
+
+_PROJECTION_VARIANTS = [
+    ("full", {}),
+    ("tracks_only", {"include_scenes": False,
+                     "include_return_tracks": False,
+                     "include_master_track": False,
+                     "include_cue_points": False}),
+    ("no_notes", {"include_notes": False}),
+    ("no_params", {"include_params": False}),
+    ("single_track", {"track_indices": [0]}),
+]
+
+
+def bench_projected_snapshots():
+    module = _load_remote_script_module()
+    rows = []
+    for track_count in (24, 128):
+        inst = module.AbletonMCP.__new__(module.AbletonMCP)
+        inst._song = _FakeSong(track_count)
+        inst.log_message = lambda *a, **k: None
+        inst.show_message = lambda *a, **k: None
+        for label, kwargs in _PROJECTION_VARIANTS:
+            result = inst._get_session_snapshot(**kwargs)
+            payload = json.dumps(result).encode("utf-8")
+            rows.append({"tracks": track_count, "variant": label,
+                         "bytes": len(payload)})
+    return rows
+
 # --------------------------------------------------------------------------
 # Output
 # --------------------------------------------------------------------------
@@ -558,6 +732,7 @@ def main(argv=None):
     results["batch_round_trips"] = bench_batch_round_trips()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
+    results["projected_snapshots"] = bench_projected_snapshots()
 
     if args.json:
         print(json.dumps(results, indent=2))
@@ -606,6 +781,20 @@ def main(argv=None):
         print("  %7d %13d %13d %15.3f %15.3f" % (
             r["tracks"], r["full_bytes"], r["lean_bytes"],
             r["full_encode_ms"], r["lean_encode_ms"]))
+    print()
+
+    print("C2. Projected snapshot sizes (real serializer, fake LOM):")
+    print("  %7s %13s %13s %13s %13s %13s" % (
+        "tracks", "full bytes", "tracks-only", "no-notes", "no-params",
+        "single-track"))
+    by_tracks = {}
+    for r in results["projected_snapshots"]:
+        by_tracks.setdefault(r["tracks"], {})[r["variant"]] = r["bytes"]
+    for track_count in sorted(by_tracks):
+        row = by_tracks[track_count]
+        print("  %7d %13d %13d %13d %13d %13d" % (
+            track_count, row["full"], row["tracks_only"], row["no_notes"],
+            row["no_params"], row["single_track"]))
     return 0
 
 

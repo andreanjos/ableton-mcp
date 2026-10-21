@@ -141,7 +141,7 @@ def test_handshake_advertises_framing_v2(script_module):
     assert info["agent0_framing"] == ["v1", "v2"]
     # The v1 handshake contract is untouched: protocol stays 1.
     assert info["protocol_version"] == 1
-    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.4"
+    assert info["script_version"] == script_module.SCRIPT_VERSION == "1.7.5"
 
 
 # ------------------------------------------------------- script side
@@ -420,7 +420,7 @@ def test_server_negotiation_requires_the_advertisement():
 
 V1_SCRIPT_INFO = {"name": "AbletonMCP", "script_version": "1.7.3",
                   "protocol_version": 1, "capabilities": []}
-V2_SCRIPT_INFO = dict(V1_SCRIPT_INFO, script_version="1.7.4",
+V2_SCRIPT_INFO = dict(V1_SCRIPT_INFO, script_version="1.7.5",
                       agent0_framing=["v1", "v2"])
 
 
