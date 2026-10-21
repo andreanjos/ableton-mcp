@@ -1467,20 +1467,30 @@ def get_browser_tree(ctx: Context, category_type: str = "all", user_prompt: str 
 @mcp.tool()
 @rich_telemetry_tool("get_browser_items_at_path")
 @trajectory_tool("get_browser_items_at_path")
-def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") -> str:
+def get_browser_items_at_path(ctx: Context, path: str, limit: Optional[int] = None, offset: Optional[int] = None, user_prompt: str = "") -> str:
     """
     Get browser items at a specific path in Ableton's browser.
 
     Parameters:
     - path: Path in the format "category/folder/subfolder"
             where category is one of the available browser categories in Ableton
+    - limit: Optional page size (MCP-07). When set (with or without
+             offset), only that slice of the items is returned and the
+             result reports "total" and "next_offset". Unset, every
+             item at the path is returned, as before.
+    - offset: Optional page offset (MCP-07).
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_browser_items_at_path", {
-            "path": path
-        })
+        # MCP-07 paging: forward only the values the caller set, so a
+        # default call sends exactly the pre-paging params.
+        params: Dict[str, Any] = {"path": path}
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
+        result = ableton.send_command("get_browser_items_at_path", params)
         
         # Check if there was an error with available categories
         if "error" in result and "available_categories" in result:
@@ -1507,6 +1517,71 @@ def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") ->
         else:
             logger.error(f"Error getting browser items at path: {error_msg}")
             return f"Error getting browser items at path: {error_msg}"
+
+@mcp.tool()
+@rich_telemetry_tool("search_browser")
+@trajectory_tool("search_browser")
+def search_browser(ctx: Context, query: str, limit: int = 50, offset: int = 0, user_prompt: str = "") -> str:
+    """
+    Search Ableton's browser by item name or URI, one page at a time.
+
+    The search runs in the Remote Script (MCP-07), so finding an item
+    no longer means fetching whole subtrees and filtering them here.
+    Matching is a case-insensitive substring test against each item's
+    name and URI, in browser order.
+
+    Parameters:
+    - query: Text to match against item names and URIs (required)
+    - limit: Page size (default 50, script-capped at 200)
+    - offset: Page offset (default 0)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Returns the page as JSON: {"query", "total", "offset", "limit",
+    "next_offset", "items"}, each item carrying its browser "path"
+    (e.g. "instruments/Kits/808 Core Kit") for use with
+    get_browser_items_at_path or a load call. Requires Remote Script
+    1.7.7+; an older script answers with the standard
+    "Unknown command: search_browser" error.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("search_browser", {
+            "query": query,
+            "limit": limit,
+            "offset": offset
+        })
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error searching browser: {str(e)}")
+        return f"Error searching browser: {str(e)}"
+
+@mcp.tool()
+@rich_telemetry_tool("refresh_browser_cache")
+@trajectory_tool("refresh_browser_cache")
+def refresh_browser_cache(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Drop the Remote Script's browser caches (MCP-07).
+
+    The script caches browser reads and URI resolutions so repeated
+    browsing doesn't re-walk the hierarchy. Call this after changing
+    the library from outside the script - installing a pack, editing
+    the user library, rescanning - so the next read sees the change.
+    (A load through the script invalidates the caches itself.)
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+
+    Returns JSON reporting how many cached entries were dropped.
+    Requires Remote Script 1.7.7+.
+    """
+    try:
+        ableton = get_ableton_connection()
+        result = ableton.send_command("refresh_browser_cache", {})
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error refreshing browser cache: {str(e)}")
+        return f"Error refreshing browser cache: {str(e)}"
+
 
 @mcp.tool()
 @rich_telemetry_tool("load_drum_kit")
