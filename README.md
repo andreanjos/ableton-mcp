@@ -535,8 +535,8 @@ error, which the tool surfaces as its usual Error string.
 
 Every command exchange runs under a per-command socket budget,
 applied before the request is sent: 65 s for `create_audio_clip`,
-the sum of the per-item budgets for `execute_batch`, 15 s for other
-state-modifying commands, 10 s for reads. Both receive paths (v1 and
+the sum of the per-item budgets for `execute_batch` (with a 15 s
+floor), 15 s for other state-modifying commands, 10 s for reads. Both receive paths (v1 and
 framing v2) honour the budget - before MCP-09 the v1 receive path
 silently overrode it with a hard 15 s, so long commands failed at
 15 s whatever budget they carried.

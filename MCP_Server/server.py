@@ -536,10 +536,11 @@ class AbletonConnection:
             logger.error(f"Socket connection error: {str(e)}")
             self._drop_connection()
             raise Exception(f"Connection to Ableton lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            # A complete response arrived but is not JSON: the command
-            # may have been applied and its result is unreadable, so
-            # this too is outcome-unknown, not a plain failure.
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # A complete response arrived but cannot be read - not
+            # JSON, or not even valid UTF-8: the command may have
+            # been applied and its result is unreadable, so this too
+            # is outcome-unknown, not a plain failure.
             logger.error(f"Invalid JSON response from Ableton: {str(e)}")
             if 'response_data' in locals() and response_data:
                 logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")

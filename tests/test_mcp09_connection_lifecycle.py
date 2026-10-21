@@ -295,6 +295,33 @@ def test_v2_unparseable_response_is_outcome_unknown_and_closes():
     assert conn.sock is None
 
 
+def test_v2_non_utf8_response_is_outcome_unknown_and_closes():
+    # A complete framed response whose bytes are not valid UTF-8:
+    # decode raises UnicodeDecodeError, not JSONDecodeError, and it
+    # must classify exactly like a parse failure (MCP-09 review F1) -
+    # the command may have been applied, so it is not safe to retry.
+    sock = GapSock(encode_frame(b"\xff\xfe\x00not utf8"))
+    conn = _conn(sock, framing_v2=True)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "Invalid response from Ableton" in str(excinfo.value)
+    assert sock.closed is True
+    assert conn.sock is None
+
+
+def test_v1_non_utf8_response_is_outcome_unknown_and_closes():
+    # The same bytes on the v1 path: the completeness probe inside
+    # receive_full_response cannot decode them either, and the
+    # failure must still surface as outcome-unknown, not a plain
+    # "safe to retry" error.
+    sock = GapSock(b"\xff\xfe\x00not utf8")
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError):
+        conn.send_command("get_session_info")
+    assert sock.closed is True
+    assert conn.sock is None
+
+
 def test_framing_reset_means_the_next_exchange_starts_on_v1():
     bad = GapSock(_v2_payload({}), gap=20.0)
     conn = _conn(bad, framing_v2=True)
