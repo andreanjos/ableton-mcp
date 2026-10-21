@@ -35,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.4"
+SCRIPT_VERSION = "1.7.5"
 PROTOCOL_VERSION = 1
 
 # Complete command surface of the _process_command dispatcher, kept sorted.
@@ -590,7 +590,15 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_session_info()
             elif command_type == "get_track_info":
                 track_index = params.get("track_index", 0)
-                response["result"] = self._get_track_info(track_index)
+                # MCP-05: projection flags are forwarded only when the
+                # caller sent them, so an unprojected call is exactly
+                # the pre-projection one.
+                info_kwargs = {}
+                for key in ("include_clip_slots", "include_devices"):
+                    if key in params:
+                        info_kwargs[key] = params[key]
+                response["result"] = self._get_track_info(
+                    track_index, **info_kwargs)
             # Commands that modify Live's state should be scheduled on the main thread
             elif command_type in ["create_midi_track", "create_audio_track", "set_track_name",
                                  "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
@@ -763,9 +771,21 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_session_snapshot":
                 include_notes = params.get("include_notes", True)
                 include_params = params.get("include_params", True)
+                # MCP-05: projection params are opt-in; forward only
+                # the ones the caller actually sent so an unprojected
+                # call is exactly the pre-projection one.
+                snapshot_kwargs = {}
+                for key in ("track_indices", "include_scenes",
+                            "include_return_tracks", "include_master_track",
+                            "include_cue_points", "include_clip_slots",
+                            "include_devices", "include_arrangement_clips",
+                            "include_automation"):
+                    if key in params:
+                        snapshot_kwargs[key] = params[key]
                 response["result"] = self._get_session_snapshot(
                     include_notes=include_notes,
                     include_params=include_params,
+                    **snapshot_kwargs
                 )
             elif command_type == "drain_passive_events":
                 response["result"] = self._drain_passive_events()
@@ -994,43 +1014,20 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting session info: " + str(e))
             raise
     
-    def _get_track_info(self, track_index):
-        """Get information about a track"""
+    def _get_track_info(self, track_index, include_clip_slots=True,
+                        include_devices=True):
+        """Get information about a track.
+
+        MCP-05 projection: include_clip_slots / include_devices may be
+        False to omit that section entirely -- it is then not serialised
+        at all. Both default True: the pre-projection result.
+        """
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
-            
+
             track = self._song.tracks[track_index]
-            
-            # Get clip slots
-            clip_slots = []
-            for slot_index, slot in enumerate(track.clip_slots):
-                clip_info = None
-                if slot.has_clip:
-                    clip = slot.clip
-                    clip_info = {
-                        "name": clip.name,
-                        "length": clip.length,
-                        "is_playing": clip.is_playing,
-                        "is_recording": clip.is_recording
-                    }
-                
-                clip_slots.append({
-                    "index": slot_index,
-                    "has_clip": slot.has_clip,
-                    "clip": clip_info
-                })
-            
-            # Get devices
-            devices = []
-            for device_index, device in enumerate(track.devices):
-                devices.append({
-                    "index": device_index,
-                    "name": device.name,
-                    "class_name": device.class_name,
-                    "type": self._get_device_type(device)
-                })
-            
+
             result = {
                 "index": track_index,
                 "name": track.name,
@@ -1041,14 +1038,45 @@ class AbletonMCP(ControlSurface):
                 "arm": self._safe_arm(track),
                 "volume": track.mixer_device.volume.value,
                 "panning": track.mixer_device.panning.value,
-                "clip_slots": clip_slots,
-                "devices": devices
             }
+
+            if include_clip_slots:
+                # Get clip slots
+                clip_slots = []
+                for slot_index, slot in enumerate(track.clip_slots):
+                    clip_info = None
+                    if slot.has_clip:
+                        clip = slot.clip
+                        clip_info = {
+                            "name": clip.name,
+                            "length": clip.length,
+                            "is_playing": clip.is_playing,
+                            "is_recording": clip.is_recording
+                        }
+
+                    clip_slots.append({
+                        "index": slot_index,
+                        "has_clip": slot.has_clip,
+                        "clip": clip_info
+                    })
+                result["clip_slots"] = clip_slots
+
+            if include_devices:
+                # Get devices
+                devices = []
+                for device_index, device in enumerate(track.devices):
+                    devices.append({
+                        "index": device_index,
+                        "name": device.name,
+                        "class_name": device.class_name,
+                        "type": self._get_device_type(device)
+                    })
+                result["devices"] = devices
+
             return result
         except Exception as e:
             self.log_message("Error getting track info: " + str(e))
             raise
-    
     def _safe_arm(self, track):
         """Read track.arm, returning False for tracks that have no arm state.
 
@@ -2366,19 +2394,29 @@ class AbletonMCP(ControlSurface):
     # a snapshot can never blow the stack or the payload size.
     _MAX_CHAIN_DEPTH = 4
 
-    def _serialize_device(self, device, device_index, include_params=True, depth=0):
+    def _serialize_device(self, device, device_index, include_params=True,
+                          include_automation=None, depth=0):
         info = {
             "index": device_index,
             "name": device.name,
             "class_name": device.class_name,
             "type": self._get_device_type(device),
         }
-        automated = self._automated_params_for_device(device)
-        if automated:
-            info["automated_parameters"] = automated
-            info["automation_enabled"] = True
-        else:
-            info["automation_enabled"] = False
+        # MCP-05: the automated-parameter scan walks every parameter of
+        # the device, and its result feeds only the two keys below -- so
+        # it runs only when those keys will be emitted. By default that
+        # is exactly when include_params is on; an explicit
+        # include_automation overrides either way. When the scan does
+        # not run, both keys are omitted entirely.
+        scan_automation = include_params if include_automation is None \
+            else bool(include_automation)
+        if scan_automation:
+            automated = self._automated_params_for_device(device)
+            if automated:
+                info["automated_parameters"] = automated
+                info["automation_enabled"] = True
+            else:
+                info["automation_enabled"] = False
 
         if include_params:
             params = []
@@ -2416,11 +2454,13 @@ class AbletonMCP(ControlSurface):
                 info["chains_truncated"] = True
             else:
                 info["chains"] = self._serialize_chains(
-                    device, include_params=include_params, depth=depth
+                    device, include_params=include_params,
+                    include_automation=include_automation, depth=depth
                 )
         return info
 
-    def _serialize_chains(self, rack, include_params=True, depth=0):
+    def _serialize_chains(self, rack, include_params=True,
+                          include_automation=None, depth=0):
         chains = []
         try:
             chain_lists = [("chains", getattr(rack, "chains", []))]
@@ -2458,6 +2498,7 @@ class AbletonMCP(ControlSurface):
                                     dev,
                                     d_i,
                                     include_params=include_params,
+                                    include_automation=include_automation,
                                     depth=depth + 1,
                                 )
                             )
@@ -2564,14 +2605,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("cue_points serialize failed: " + str(e))
         return cues
 
-    def _serialize_return_tracks(self, include_params=True):
+    def _serialize_return_tracks(self, include_params=True,
+                                 include_automation=None):
         returns = []
         try:
             for i, track in enumerate(self._song.return_tracks):
                 devices = []
                 for d_i, device in enumerate(track.devices):
                     devices.append(
-                        self._serialize_device(device, d_i, include_params=include_params)
+                        self._serialize_device(device, d_i, include_params=include_params,
+                                       include_automation=include_automation)
                     )
                 returns.append({
                     "index": i,
@@ -2586,14 +2629,16 @@ class AbletonMCP(ControlSurface):
             self.log_message("return_tracks serialize failed: " + str(e))
         return returns
 
-    def _serialize_master_track(self, include_params=True):
+    def _serialize_master_track(self, include_params=True,
+                                include_automation=None):
         """Master chain — the bus compressor/limiter that shapes the final sound."""
         try:
             track = self._song.master_track
             devices = []
             for d_i, device in enumerate(track.devices):
                 devices.append(
-                    self._serialize_device(device, d_i, include_params=include_params)
+                    self._serialize_device(device, d_i, include_params=include_params,
+                                       include_automation=include_automation)
                 )
             return {
                 "volume": float(track.mixer_device.volume.value),
@@ -2646,48 +2691,46 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting device parameters: " + str(e))
             raise
 
-    def _get_session_snapshot(self, include_notes=True, include_params=True):
-        """Full v2 project state dump for trajectory dataset recording."""
+    def _get_session_snapshot(self, include_notes=True, include_params=True,
+                              track_indices=None, include_scenes=True,
+                              include_return_tracks=True,
+                              include_master_track=True,
+                              include_cue_points=True,
+                              include_clip_slots=True, include_devices=True,
+                              include_arrangement_clips=True,
+                              include_automation=None):
+        """Full v2 project state dump for trajectory dataset recording.
+
+        MCP-05 projection -- every parameter is opt-in and defaults to
+        the pre-projection behaviour:
+        - track_indices restricts the tracks list to those song indices
+          (invalid entries ignored, song order preserved);
+        - include_scenes / include_return_tracks / include_master_track /
+          include_cue_points = False omits that top-level section;
+        - include_clip_slots / include_devices /
+          include_arrangement_clips = False omits that per-track section;
+        - include_automation overrides whether the automated-parameter
+          scan runs (default: follows include_params; see
+          _serialize_device).
+        An omitted section is not serialised at all.
+        """
         try:
             session = self._get_session_info()
+            if track_indices is None:
+                selected = list(range(len(self._song.tracks)))
+            else:
+                wanted = set()
+                for entry in track_indices:
+                    try:
+                        wanted.add(int(entry))
+                    except (TypeError, ValueError):
+                        continue
+                selected = [i for i in range(len(self._song.tracks))
+                            if i in wanted]
             tracks = []
-            for track_index, track in enumerate(self._song.tracks):
-                clip_slots = []
-                for slot_index, slot in enumerate(track.clip_slots):
-                    clip_info = None
-                    if slot.has_clip:
-                        clip_info = self._serialize_session_clip(
-                            slot.clip, include_notes=include_notes
-                        )
-                    clip_slots.append({
-                        "index": slot_index,
-                        "has_clip": bool(slot.has_clip),
-                        "clip": clip_info,
-                    })
-
-                devices = []
-                for device_index, device in enumerate(track.devices):
-                    devices.append(
-                        self._serialize_device(
-                            device, device_index, include_params=include_params
-                        )
-                    )
-
-                arrangement_clips = []
-                try:
-                    for clip in track.arrangement_clips:
-                        arrangement_clips.append(
-                            self._serialize_arrangement_clip(
-                                clip, include_notes=include_notes
-                            )
-                        )
-                except Exception as e:
-                    self.log_message(
-                        "arrangement_clips unavailable on track %d: %s"
-                        % (track_index, str(e))
-                    )
-
-                tracks.append({
+            for track_index in selected:
+                track = self._song.tracks[track_index]
+                entry = {
                     "index": track_index,
                     "name": track.name,
                     "is_audio_track": bool(track.has_audio_input),
@@ -2698,30 +2741,78 @@ class AbletonMCP(ControlSurface):
                     "volume": float(track.mixer_device.volume.value),
                     "panning": float(track.mixer_device.panning.value),
                     "sends": self._serialize_sends(track),
-                    "clip_slots": clip_slots,
-                    "devices": devices,
-                    "arrangement_clips": arrangement_clips,
-                })
+                }
 
-            return {
+                if include_clip_slots:
+                    clip_slots = []
+                    for slot_index, slot in enumerate(track.clip_slots):
+                        clip_info = None
+                        if slot.has_clip:
+                            clip_info = self._serialize_session_clip(
+                                slot.clip, include_notes=include_notes
+                            )
+                        clip_slots.append({
+                            "index": slot_index,
+                            "has_clip": bool(slot.has_clip),
+                            "clip": clip_info,
+                        })
+                    entry["clip_slots"] = clip_slots
+
+                if include_devices:
+                    devices = []
+                    for device_index, device in enumerate(track.devices):
+                        devices.append(
+                            self._serialize_device(
+                                device, device_index,
+                                include_params=include_params,
+                                include_automation=include_automation
+                            )
+                        )
+                    entry["devices"] = devices
+
+                if include_arrangement_clips:
+                    arrangement_clips = []
+                    try:
+                        for clip in track.arrangement_clips:
+                            arrangement_clips.append(
+                                self._serialize_arrangement_clip(
+                                    clip, include_notes=include_notes
+                                )
+                            )
+                    except Exception as e:
+                        self.log_message(
+                            "arrangement_clips unavailable on track %d: %s"
+                            % (track_index, str(e))
+                        )
+                    entry["arrangement_clips"] = arrangement_clips
+
+                tracks.append(entry)
+
+            result = {
                 "schema": "ableton_mcp_snapshot_v2",
                 "session": session,
                 "tracks": tracks,
-                "scenes": self._serialize_scenes(),
-                "return_tracks": self._serialize_return_tracks(
-                    include_params=include_params
-                ),
-                "master_track": self._serialize_master_track(
-                    include_params=include_params
-                ),
-                "cue_points": self._serialize_cue_points(),
-                "include_notes": bool(include_notes),
-                "include_params": bool(include_params),
             }
+            if include_scenes:
+                result["scenes"] = self._serialize_scenes()
+            if include_return_tracks:
+                result["return_tracks"] = self._serialize_return_tracks(
+                    include_params=include_params,
+                    include_automation=include_automation
+                )
+            if include_master_track:
+                result["master_track"] = self._serialize_master_track(
+                    include_params=include_params,
+                    include_automation=include_automation
+                )
+            if include_cue_points:
+                result["cue_points"] = self._serialize_cue_points()
+            result["include_notes"] = bool(include_notes)
+            result["include_params"] = bool(include_params)
+            return result
         except Exception as e:
             self.log_message("Error getting session snapshot: " + str(e))
             raise
-
     def _set_device_parameter(self, track_index, device_index, parameter_index, value):
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):

@@ -353,13 +353,49 @@ From Python nothing changes: `send_command` / `send_batch` frame
 transparently once negotiated, and `last_timing` is populated on
 every v2 exchange.
 
+### Projected state reads
+
+`get_session_snapshot` and `get_track_info` accept opt-in projection
+parameters: the caller names the sections it actually needs, and the
+Remote Script does not serialise -- or even compute -- the rest. Every
+parameter is optional and defaults to the pre-projection behaviour, so
+an unprojected call returns exactly the result it always has, and a v1
+client that never sends the new params is unaffected.
+
+Snapshot parameters (all optional):
+
+- `track_indices`: restrict the `tracks` list to these song indices
+  (invalid entries are ignored, song order is preserved).
+- `include_scenes`, `include_return_tracks`, `include_master_track`,
+  `include_cue_points`: set one to `false` to omit that top-level
+  section from the result entirely.
+- `include_clip_slots`, `include_devices`, `include_arrangement_clips`:
+  set one to `false` to omit that per-track section.
+- `include_automation`: the automated-parameter scan walks every
+  parameter of every device and feeds only the `automated_parameters` /
+  `automation_enabled` keys on each device. It runs when device
+  parameters are included (`include_params`, as before); set
+  `include_automation` explicitly to override either way. When the
+  scan does not run, both keys are omitted.
+
+Track info parameters: `include_clip_slots` and `include_devices`, with
+the same omit-when-false semantics. The `get_session_snapshot` and
+`get_track_info` MCP tools expose the same parameters and forward only
+the values a caller actually set, so a default tool call sends exactly
+the params it sent before. Measured with the benchmark below (real
+serializer, fake Live set): a full 128-track snapshot is about 2.5 MB;
+asking for one track brings back about 31 KB at any set size. Requires
+Remote Script 1.7.5+ for the projection to take effect; older scripts
+ignore the new params and return the full result, as before.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
 runs a headless protocol benchmark - no Live required: the repeated-parse
 framing cost on both endpoints against fake sockets, round-trip counts for
-representative composite workflows against a fake TCP peer, and a synthetic
-snapshot serialisation model. Add `--json` for machine-readable output.
+representative composite workflows against a fake TCP peer, a synthetic
+snapshot serialisation model, and full vs projected snapshot sizes from
+the real serializer. Add `--json` for machine-readable output.
 
 ## Limitations & Security Considerations
 
