@@ -184,8 +184,10 @@ class AbletonConnection:
         never leaves its socket open behind it, and the framing
         adoption never survives the connection it was negotiated on.
         Before MCP-09 the error paths simply assigned ``self.sock =
-        None`` - the socket was never closed and ``_framing_v2`` stayed
-        set until the next successful connect() happened to reset it.
+        None``: the socket was dropped without being closed - when its
+        descriptor actually closed was left to refcounting - and
+        ``_framing_v2`` stayed set until the next successful connect()
+        happened to reset it.
         ``_next_request_id`` is deliberately left alone: connect()
         restarts allocation at 1, as before.
         """
@@ -335,7 +337,11 @@ class AbletonConnection:
         once, so the whole list costs one socket round trip. Returns the
         batch result: ``{"results": [...], "summary": {...}}``, where
         each entry of ``results`` is the response envelope a direct
-        ``send_command`` of that item would have produced (or a
+        ``send_command`` of that item would have produced - for items
+        that reach dispatch; an item the script rejects before
+        dispatch (malformed, a nested batch) carries a batch-style
+        error envelope instead: the same message, without the
+        ``result`` key a dispatched call's envelope carries (or a
         ``{"status": "skipped", ...}`` marker under ``stop_on_error``).
 
         A failed item does NOT raise here - inspect the per-item

@@ -36,7 +36,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.9"
+SCRIPT_VERSION = "1.7.10"
 PROTOCOL_VERSION = 1
 
 # MCP-10: the dispatcher table - the single source for the handshake
@@ -1039,10 +1039,14 @@ class AbletonMCP(ControlSurface):
         wait instead of N of each.
 
         This is a sequencing primitive, NOT a transaction. Items run in
-        order; each produces exactly the response envelope a direct call
-        would have produced; a failed item does not roll back the items
-        before it. With stop_on_error, items after the first failure are
-        not run and are reported as {"status": "skipped", ...} - never
+        order; each item that reaches dispatch produces exactly the
+        response envelope a direct call would have produced, while an
+        item rejected before dispatch (see _execute_batch_item) reports
+        a batch-style error envelope - the same message, without the
+        "result": {} key a dispatched call's envelope carries. A failed
+        item does not roll back the items before it. With stop_on_error,
+        items after the first failure are not run and are reported as
+        {"status": "skipped", ...} - never
         silently dropped. The success result is
         {"results": [...], "summary": {"total": n, "succeeded": n,
         "failed": n, "skipped": n}}.
@@ -1125,7 +1129,7 @@ class AbletonMCP(ControlSurface):
                     "message": "Timeout waiting for batch to complete"}
 
     def _execute_batch_item(self, item, timed):
-        """Dispatch one execute_batch item exactly as a direct call.
+        """Dispatch one execute_batch item through the direct path.
 
         ``timed`` propagates the batch's own timing opt-in: items of a
         timed batch carry "timing": true, so each per-item envelope gets
@@ -1133,7 +1137,12 @@ class AbletonMCP(ControlSurface):
         item); items of an untimed batch produce envelopes identical to
         direct calls. Guarded commands keep their guards: a guarded
         item runs the same handler - and the same checks - as the direct
-        command, because dispatch is the direct path.
+        command, because dispatch is the direct path. Items rejected
+        here, before dispatch - a non-object item, a nested
+        execute_batch, a non-object "params" - return the batch-style
+        error envelope {"status": "error", "message": ...} without the
+        "result": {} key; everything that is dispatched returns
+        _process_command's envelope, exactly as a direct call.
         """
         if not isinstance(item, dict):
             return {"status": "error",
