@@ -21,13 +21,14 @@ dependencies = [
 [project.scripts]
 ableton-mcp = "MCP_Server.server:main"
 ableton-mcp-install-script = "MCP_Server.remote_script_install:main"
+ableton-mcp-benchmark = "benchmarks.protocol_benchmark:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["MCP_Server", "MCP_Server.dataset", "MCP_Server.bundled_ableton_remote_script"]
+packages = ["MCP_Server", "MCP_Server.dataset", "MCP_Server.bundled_ableton_remote_script", "benchmarks"]
 # MANIFEST.in governs the sdist; this governs the wheel. Both are needed.
 exclude-package-data = { "MCP_Server" = ["config.py"] }
 

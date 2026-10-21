@@ -34,30 +34,86 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.1"
+SCRIPT_VERSION = "1.7.2"
 PROTOCOL_VERSION = 1
 
+# Complete command surface of the _process_command dispatcher, kept sorted.
+# A fork test derives the dispatcher's command set from this file's AST and
+# pins this list to it, so the handshake can never again advertise a subset
+# of what the script implements (it once advertised 19 of 37 commands).
 SCRIPT_CAPABILITIES = [
-    "get_session_info",
-    "get_track_info",
-    "get_script_info",
-    "get_clip_notes",
-    "get_device_parameters",
-    "get_session_snapshot",
-    "set_device_parameter",
-    "drain_passive_events",
-    "create_midi_track",
+    "add_notes_to_clip",
+    "clear_notes_from_clip",
+    "create_audio_clip",
     "create_audio_track",
     "create_clip",
-    "create_audio_clip",
-    "add_notes_to_clip",
-    "load_instrument_or_effect",
-    "get_arrangement_clips",
-    "duplicate_session_clip_to_arrangement",
     "create_locator",
+    "create_midi_track",
     "delete_clip",
-    "clear_notes_from_clip",
+    "drain_passive_events",
+    "duplicate_session_clip_to_arrangement",
+    "fire_clip",
+    "get_arrangement_clips",
+    "get_browser_categories",
+    "get_browser_item",
+    "get_browser_items",
+    "get_browser_items_at_path",
+    "get_browser_tree",
+    "get_clip_notes",
+    "get_device_parameters",
+    "get_script_info",
+    "get_session_info",
+    "get_session_snapshot",
+    "get_track_info",
+    "inspect_rack",
+    "load_browser_item",
+    "load_instrument_or_effect",
+    "map_rack_magnitude",
+    "set_arrangement_clip_name",
+    "set_clip_name",
+    "set_current_song_time",
+    "set_device_parameter",
+    "set_tempo",
+    "set_track_name",
+    "start_playback",
+    "stop_clip",
+    "stop_playback",
+    "switch_to_arrangement_view",
 ]
+
+# MCP-01 native timing: largest request id the wire's JSON consumers can
+# represent exactly (2**53 - 1).
+MAX_REQUEST_ID = 9007199254740991
+
+
+def _is_valid_request_id(value):
+    """A request_id is an integer in [0, MAX_REQUEST_ID]; bools excluded."""
+    return type(value) is int and 0 <= value <= MAX_REQUEST_ID
+
+
+def _finish_agent0_timing(response, timing_state):
+    """Attach the agent0_timing block to a response envelope.
+
+    dispatch_ms: _process_command entry -> response ready (excludes socket
+    receive and response send, as in the original host-patch design).
+    queue_ms: dispatch entry -> main-thread task start; None for commands
+    that run directly on the socket thread.
+    execution_ms: main-thread task start -> finish; None likewise.
+    """
+    finished = time.perf_counter()
+    started = timing_state["started"]
+    main_started = timing_state.get("main_started")
+    main_finished = timing_state.get("main_finished")
+    response["agent0_timing"] = {
+        "dispatch_ms": (finished - started) * 1000.0,
+        "queue_ms": ((main_started - started) * 1000.0
+                     if main_started is not None else None),
+        "execution_ms": ((main_finished - main_started) * 1000.0
+                         if main_started is not None
+                         and main_finished is not None else None),
+    }
+    if timing_state.get("request_id") is not None:
+        response["request_id"] = timing_state["request_id"]
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -267,10 +323,53 @@ class AbletonMCP(ControlSurface):
                 pass
             self.log_message("Client handler stopped")
     
+    def _schedule_main_thread_task(self, task, timing_state):
+        """Schedule *task* on Live's main thread, optionally timed.
+
+        With timing_state None this is exactly the historical behaviour
+        (including running the task inline when already on the main
+        thread). With timing requested, the task is wrapped so queue_ms /
+        execution_ms can be reported; the finish stamp is taken just
+        after the task returns, i.e. just after it queued its response.
+        """
+        if timing_state is None:
+            try:
+                self.schedule_message(0, task)
+            except AssertionError:
+                # If we're already on the main thread, execute directly
+                task()
+            return
+
+        def timed_task():
+            timing_state["main_started"] = time.perf_counter()
+            try:
+                task()
+            finally:
+                timing_state["main_finished"] = time.perf_counter()
+
+        try:
+            self.schedule_message(0, timed_task)
+        except AssertionError:
+            timed_task()
+
     def _process_command(self, command):
         """Process a command from the client and return a response"""
         command_type = command.get("type", "")
         params = command.get("params", {})
+
+        # MCP-01 native timing (opt-in per request). A command carrying a
+        # "request_id" -- or "timing": true -- gets an agent0_timing block
+        # on its response envelope and its request_id echoed. Requests that
+        # do not opt in take the historical path untouched: no clock reads
+        # beyond this membership check and no extra response keys.
+        timing_state = None
+        if "request_id" in command or command.get("timing"):
+            if "request_id" in command and not _is_valid_request_id(command.get("request_id")):
+                return {"status": "error", "message": "Invalid request ID"}
+            timing_state = {
+                "started": time.perf_counter(),
+                "request_id": command.get("request_id"),
+            }
         
         # Initialize response
         response = {
@@ -409,11 +508,7 @@ class AbletonMCP(ControlSurface):
                         response_queue.put({"status": "error", "message": str(e)})
                 
                 # Schedule the task to run on the main thread
-                try:
-                    self.schedule_message(0, main_thread_task)
-                except AssertionError:
-                    # If we're already on the main thread, execute directly
-                    main_thread_task()
+                self._schedule_main_thread_task(main_thread_task, timing_state)
                 
                 # create_audio_clip decodes/imports the file on the main
                 # thread and needs more than the default headroom.
@@ -486,10 +581,7 @@ class AbletonMCP(ControlSurface):
                         self.log_message(traceback.format_exc())
                         response_queue.put({"status": "error", "message": str(e)})
 
-                try:
-                    self.schedule_message(0, main_thread_task)
-                except AssertionError:
-                    main_thread_task()
+                self._schedule_main_thread_task(main_thread_task, timing_state)
 
                 try:
                     task_response = response_queue.get(timeout=10.0)
@@ -510,6 +602,8 @@ class AbletonMCP(ControlSurface):
             response["status"] = "error"
             response["message"] = str(e)
         
+        if timing_state is not None:
+            _finish_agent0_timing(response, timing_state)
         return response
     
     # Command implementations
@@ -524,6 +618,9 @@ class AbletonMCP(ControlSurface):
             "capabilities": list(SCRIPT_CAPABILITIES),
             "snapshot_schema": "ableton_mcp_snapshot_v2",
             "passive_listeners": True,
+            "agent0_request_ids": True,
+            "agent0_capabilities_complete": True,
+            "agent0_host_revision": 1,
         }
     
     def _safe_song_property(self, attr, cast, default):

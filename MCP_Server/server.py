@@ -28,6 +28,11 @@ class AbletonConnection:
     port: int
     sock: socket.socket = None
 
+    # MCP-01: populated only by exchanges sent with request_id=...
+    # (see send_command). None until the first timed exchange completes.
+    last_timing: Any = None
+    last_request_id: Any = None
+
     # One socket, several threads: tool calls run on the MCP worker while the
     # passive poller drains events on its own thread. Serialise so their
     # sendall/recv pairs cannot interleave.
@@ -108,7 +113,7 @@ class AbletonConnection:
         else:
             raise Exception("No data received")
 
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    def send_command(self, command_type: str, params: Dict[str, Any] = None, request_id: int = None) -> Dict[str, Any]:
         """Send a command to Ableton and return the response.
 
         Serialised on ``self._lock``: the request and its response are one
@@ -117,9 +122,9 @@ class AbletonConnection:
         caller from reading someone else's reply.
         """
         with self._lock:
-            return self._send_command_locked(command_type, params)
+            return self._send_command_locked(command_type, params, request_id)
 
-    def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None, request_id: int = None) -> Dict[str, Any]:
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Ableton")
 
@@ -127,6 +132,15 @@ class AbletonConnection:
             "type": command_type,
             "params": params or {}
         }
+
+        # MCP-01 (opt-in): attach a request id only when the caller asked
+        # for one. The Remote Script echoes it and adds an agent0_timing
+        # block; without request_id the wire request is unchanged.
+        if request_id is not None:
+            if type(request_id) is not int or not 0 <= request_id <= 9007199254740991:
+                raise ValueError(
+                    "request_id must be an integer in [0, 9007199254740991]")
+            command["request_id"] = request_id
         
         # Check if this is a state-modifying command
         is_modifying_command = command_type in [
@@ -174,6 +188,16 @@ class AbletonConnection:
                 logger.error(f"Ableton error: {response.get('message')}")
                 raise Exception(response.get("message", "Unknown error from Ableton"))
             
+            if request_id is not None:
+                if response.get("request_id") != request_id:
+                    raise Exception(
+                        "Remote Script did not echo request_id %r "
+                        "(response carried %r); the loaded script may "
+                        "not support request IDs" % (
+                            request_id, response.get("request_id")))
+                self.last_timing = response.get("agent0_timing")
+                self.last_request_id = request_id
+
             return response.get("result", {})
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Ableton")
