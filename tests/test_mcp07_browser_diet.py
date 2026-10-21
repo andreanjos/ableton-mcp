@@ -16,6 +16,8 @@ property counts every hierarchy descent:
 * get_browser_items_at_path paging is opt-in: slices of the paged
   form concatenate to exactly the unpaged items, with total /
   next_offset bookkeeping;
+* a degenerate limit (0 or negative) on either paged read is
+  clamped to a page size of 1, so next_offset always advances;
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -377,6 +379,31 @@ def test_items_paging_limit_only_and_offset_only():
     assert [i["name"] for i in page["items"]] == ["Kit 07", "Kit 08"]
 
 
+def test_items_paging_degenerate_limit_advances():
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    unpaged = wire(inst, "get_browser_items_at_path", {"path": "drums/Kits"})
+    for bad_limit in (0, -5):
+        page = wire(inst, "get_browser_items_at_path",
+                    {"path": "drums/Kits", "limit": bad_limit, "offset": 0})
+        # The effective page size is clamped to 1: one item, and
+        # next_offset strictly advances instead of repeating 0.
+        assert page["total"] == 10
+        assert page["items"] == unpaged["items"][:1]
+        assert page["next_offset"] == 1
+    # A client blindly following next_offset with limit=0 terminates
+    # and stitches exactly the unpaged items, one per page.
+    stitched, offset, pages = [], 0, 0
+    while offset is not None:
+        page = wire(inst, "get_browser_items_at_path",
+                    {"path": "drums/Kits", "limit": 0, "offset": offset})
+        stitched.extend(page["items"])
+        offset = page["next_offset"]
+        pages += 1
+    assert pages == 10
+    assert stitched == unpaged["items"]
+
+
 # ── search_browser ───────────────────────────────────────────────────
 
 def test_search_matches_by_name_in_browser_order():
@@ -420,6 +447,32 @@ def test_search_paging_slices_equal_full_result():
         offset = page["next_offset"]
         chain.append(offset)
     assert chain == [4, 8, None]
+    assert stitched == full["items"]
+
+
+def test_search_degenerate_limit_advances():
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    full = wire(inst, "search_browser", {"query": "kit", "limit": 200})
+    for bad_limit in (0, -5):
+        page = wire(inst, "search_browser",
+                    {"query": "kit", "limit": bad_limit, "offset": 0})
+        # The effective page size is clamped to 1 and reported as
+        # such; next_offset strictly advances instead of repeating 0.
+        assert page["limit"] == 1
+        assert page["total"] == 11
+        assert page["items"] == full["items"][:1]
+        assert page["next_offset"] == 1
+    # A client blindly following next_offset with limit=0 terminates
+    # and stitches exactly the full result, one per page.
+    stitched, offset, pages = [], 0, 0
+    while offset is not None:
+        page = wire(inst, "search_browser",
+                    {"query": "kit", "limit": 0, "offset": offset})
+        stitched.extend(page["items"])
+        offset = page["next_offset"]
+        pages += 1
+    assert pages == 11
     assert stitched == full["items"]
 
 

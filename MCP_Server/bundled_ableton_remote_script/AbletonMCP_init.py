@@ -133,19 +133,21 @@ def _is_valid_request_id(value):
     return type(value) is int and 0 <= value <= MAX_REQUEST_ID
 
 
-def _coerce_page_int(value, default, maximum=None):
+def _coerce_page_int(value, default, maximum=None, minimum=0):
     """Lenient page-parameter coercion (MCP-07), in the style of the
     MCP-06 subset selectors: an unusable value falls back to the
     default instead of failing the whole read; a usable one is
-    clamped to [0, maximum]."""
+    clamped to [minimum, maximum]. Page sizes pass minimum=1: a
+    zero-size page would report a next_offset equal to its own
+    offset, so a client paging on next_offset would never advance."""
     if value is None:
         return default
     try:
         number = int(value)
     except (TypeError, ValueError):
         return default
-    if number < 0:
-        number = 0
+    if number < minimum:
+        number = minimum
     if maximum is not None and number > maximum:
         number = maximum
     return number
@@ -2070,9 +2072,10 @@ class AbletonMCP(ControlSurface):
 
         Params: ``query`` (required; a case-insensitive substring
         matched against each item's name and URI), ``limit`` (default
-        50, at most MAX_BROWSER_SEARCH_PAGE_SIZE) and ``offset``
-        (default 0). Searching used to mean fetching whole subtrees
-        and filtering client-side; here one walk answers every page.
+        50, clamped to [1, MAX_BROWSER_SEARCH_PAGE_SIZE] so every
+        page advances) and ``offset`` (default 0). Searching
+        used to mean fetching whole subtrees and filtering
+        client-side; here one walk answers every page.
 
         The result mirrors the agent0_live_api paging shape:
         {"query", "total", "offset", "limit", "next_offset", "items"},
@@ -2091,7 +2094,8 @@ class AbletonMCP(ControlSurface):
                 "search_browser requires a non-empty 'query' string")
         limit = _coerce_page_int(params.get("limit"),
                                  DEFAULT_BROWSER_SEARCH_PAGE_SIZE,
-                                 MAX_BROWSER_SEARCH_PAGE_SIZE)
+                                 MAX_BROWSER_SEARCH_PAGE_SIZE,
+                                 minimum=1)
         offset = _coerce_page_int(params.get("offset"), 0)
 
         _, read_cache = self._browser_cache_state()
@@ -3513,7 +3517,7 @@ class AbletonMCP(ControlSurface):
             cached = self._browser_cache_get(read_cache, cache_key)
             if cached is not None:
                 return cached
-            
+
             # The attribute list drives root resolution below
             # (and the unknown-category result). It used to also
             # be logged on every call - a full dir() dump per
@@ -3603,7 +3607,7 @@ class AbletonMCP(ControlSurface):
                 page_offset = _coerce_page_int(offset, 0)
                 page_limit = _coerce_page_int(
                     limit, DEFAULT_BROWSER_ITEMS_PAGE_SIZE,
-                    MAX_BROWSER_ITEMS_PAGE_SIZE)
+                    MAX_BROWSER_ITEMS_PAGE_SIZE, minimum=1)
                 page = children[page_offset:page_offset + page_limit]
 
             items = []
