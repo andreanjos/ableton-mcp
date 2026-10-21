@@ -9,11 +9,54 @@ from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Union
 
-from .telemetry import record_startup
-from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
-from .dataset import dataset_enabled, get_recorder
-from .dataset.trajectory_decorator import trajectory_tool
 from .framing import FrameDecoder, encode_frame
+
+
+def _env_flag(name: str) -> bool:
+    """Read a boolean env switch — same spellings as the ABLETON_MCP_DISABLE_* flags."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# MCP-04: the lean profile, opt-in via ABLETON_MCP_LEAN_PROFILE=1.
+#
+# For deployments that drive Live purely as a control path (the Omnicorp
+# profile) and never use the dataset side plane. Where the
+# ABLETON_MCP_DISABLE_* switches merely gate the telemetry/dataset
+# machinery off, the lean profile leaves it unwired entirely: this
+# module never imports it, the tool decorators are pass-throughs, the
+# passive poller cannot start, and no Supabase client is constructed.
+# Tool results switch from pretty-printed JSON to compact JSON, and
+# INFO logs carry command names and byte counts instead of full
+# parameters. With the variable unset the default profile is unchanged
+# in every observable way.
+LEAN_PROFILE = _env_flag("ABLETON_MCP_LEAN_PROFILE")
+
+if LEAN_PROFILE:
+    def _passthrough_decorator_factory(*_args, **_kwargs):
+        """Stand-in for the telemetry/trajectory decorator factories: identity."""
+
+        def decorator(func):
+            return func
+
+        return decorator
+
+    telemetry_tool = _passthrough_decorator_factory
+    rich_telemetry_tool = _passthrough_decorator_factory
+    trajectory_tool = _passthrough_decorator_factory
+
+    def record_startup(*_args, **_kwargs):
+        return None
+
+    def dataset_enabled() -> bool:
+        return False
+
+    def get_recorder(*_args, **_kwargs):
+        return None
+else:
+    from .telemetry import record_startup
+    from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
+    from .dataset import dataset_enabled, get_recorder
+    from .dataset.trajectory_decorator import trajectory_tool
 
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
@@ -273,7 +316,15 @@ class AbletonConnection:
         long_running_commands = {"create_audio_clip": 65.0}
         
         try:
-            logger.info(f"Sending command: {command_type} with params: {params}")
+            if LEAN_PROFILE:
+                # Logging diet (MCP-04): the command name and the params
+                # size, never the parameter payload itself.
+                logger.info(
+                    f"Sending command: {command_type} "
+                    f"(params: {len(json.dumps(params or {}).encode('utf-8'))} bytes)"
+                )
+            else:
+                logger.info(f"Sending command: {command_type} with params: {params}")
             
             # Send the command. Under framing v2 the same JSON bytes
             # travel length-prefixed; the script answers in whichever
@@ -381,7 +432,14 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
             logger.warning(f"Could not connect to Ableton on startup: {str(e)}")
             logger.warning("Make sure the Ableton Remote Script is running")
 
-        if dataset_enabled():
+        if LEAN_PROFILE:
+            # No dataset/poller startup steps at all (MCP-04); the
+            # script handshake above still happened.
+            logger.info(
+                "Lean profile on (ABLETON_MCP_LEAN_PROFILE) — dataset and "
+                "telemetry side plane disabled"
+            )
+        elif dataset_enabled():
             try:
                 recorder = get_recorder()
                 if recorder:
@@ -421,12 +479,13 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         yield {"script_info": script_info}
     finally:
         global _ableton_connection
-        try:
-            from .dataset.passive_poller import stop_passive_poller
+        if not LEAN_PROFILE:
+            try:
+                from .dataset.passive_poller import stop_passive_poller
 
-            stop_passive_poller()
-        except Exception as e:
-            logger.debug(f"Failed to stop passive poller: {e}")
+                stop_passive_poller()
+            except Exception as e:
+                logger.debug(f"Failed to stop passive poller: {e}")
         if _ableton_connection:
             logger.info("Disconnecting from Ableton on shutdown")
             _ableton_connection.disconnect()
@@ -517,6 +576,21 @@ def get_ableton_connection():
     return _ableton_connection
 
 
+def _dump_tool_result(value: Any) -> str:
+    """Serialise a Live-facing tool result for return to the client.
+
+    The default profile pretty-prints with indent=2, byte-identical to
+    the historical output. The lean profile (MCP-04) returns the same
+    JSON value compactly — no pretty-printing — removing the size
+    inflation the audit measured on note/snapshot results. Only JSON
+    dumps go through here; string-rendered tools (browser tree, drum
+    kit, short-sentence results) keep their own rendering.
+    """
+    if LEAN_PROFILE:
+        return json.dumps(value, separators=(",", ":"))
+    return json.dumps(value, indent=2)
+
+
 # Core Tool endpoints
 
 @mcp.tool()
@@ -548,24 +622,34 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
             "you will not be asked again."
         )
 
-    try:
-        from .telemetry import refresh_consent_from_dataset
+    if LEAN_PROFILE:
+        # Lean profile (MCP-04): the consent answer above is still the
+        # user's to record, but recording itself is structurally off.
+        # Mirror the disabled-switch outcome — the "recording is
+        # unavailable" return below — without refreshing telemetry
+        # consent, touching the recorder, or starting the poller (the
+        # poller's own gate knows nothing of the lean profile, so a
+        # stored grant would otherwise start it).
+        recorder = None
+    else:
+        try:
+            from .telemetry import refresh_consent_from_dataset
 
-        refresh_consent_from_dataset()
-        recorder = get_recorder()
-        # Under opt-in the poller is almost never started at boot — consent did
-        # not exist yet — so a grant has to start it here or passive Live events
-        # would be missed for the rest of the session. Idempotent and
-        # self-gating, so this is safe even if startup did start it.
-        from .dataset.passive_poller import start_passive_poller
+            refresh_consent_from_dataset()
+            recorder = get_recorder()
+            # Under opt-in the poller is almost never started at boot — consent did
+            # not exist yet — so a grant has to start it here or passive Live events
+            # would be missed for the rest of the session. Idempotent and
+            # self-gating, so this is safe even if startup did start it.
+            from .dataset.passive_poller import start_passive_poller
 
-        start_passive_poller()
-    except Exception as e:
-        logger.error(f"Consent saved but recording failed to start: {str(e)}")
-        return (
-            "Consent saved, but recording could not start in this session. "
-            "It will begin after a restart."
-        )
+            start_passive_poller()
+        except Exception as e:
+            logger.error(f"Consent saved but recording failed to start: {str(e)}")
+            return (
+                "Consent saved, but recording could not start in this session. "
+                "It will begin after a restart."
+            )
 
     if recorder is None:
         return (
@@ -590,7 +674,7 @@ def get_session_info(ctx: Context, user_prompt: str = "") -> str:
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("get_session_info")
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting session info from Ableton: {str(e)}")
         return f"Error getting session info: {str(e)}"
@@ -613,7 +697,7 @@ def get_remote_script_info(ctx: Context, user_prompt: str = "") -> str:
         info = handshake(ableton.send_command)
         cached = dict(get_cached_script_info() or info)
         cached["expected_version"] = EXPECTED_REMOTE_SCRIPT_VERSION
-        return json.dumps(cached, indent=2)
+        return _dump_tool_result(cached)
     except Exception as e:
         logger.error(f"Error getting remote script info: {str(e)}")
         return f"Error getting remote script info: {str(e)}"
@@ -632,7 +716,7 @@ def get_track_info(ctx: Context, track_index: int, user_prompt: str = "") -> str
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("get_track_info", {"track_index": track_index})
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting track info from Ableton: {str(e)}")
         return f"Error getting track info: {str(e)}"
@@ -668,7 +752,7 @@ def get_clip_notes(
             "get_clip_notes",
             {"track_index": track_index, "clip_index": clip_index},
         )
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting clip notes: {str(e)}")
         return f"Error getting clip notes: {str(e)}"
@@ -697,7 +781,7 @@ def get_device_parameters(
             "get_device_parameters",
             {"track_index": track_index, "device_index": device_index},
         )
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting device parameters: {str(e)}")
         return f"Error getting device parameters: {str(e)}"
@@ -781,7 +865,7 @@ def get_session_snapshot(
                 "include_params": include_params,
             },
         )
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting session snapshot: {str(e)}")
         return f"Error getting session snapshot: {str(e)}"
@@ -1155,7 +1239,7 @@ def delete_clip(ctx: Context, track_index: int, clip_index: int, user_prompt: st
             "track_index": track_index,
             "clip_index": clip_index,
         })
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error deleting clip: {str(e)}")
         return f"Error deleting clip: {str(e)}"
@@ -1286,7 +1370,7 @@ def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") ->
             return (f"Error: {error}\n"
                    f"Available browser categories: {', '.join(available_cats)}")
         
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         error_msg = str(e)
         if "Browser is not available" in error_msg:
@@ -1413,7 +1497,7 @@ def get_arrangement_clips(ctx: Context, track_index: int, user_prompt: str = "")
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("get_arrangement_clips", {"track_index": track_index})
-        return json.dumps(result, indent=2)
+        return _dump_tool_result(result)
     except Exception as e:
         logger.error(f"Error getting arrangement clips: {str(e)}")
         return f"Error getting arrangement clips: {str(e)}"

@@ -420,6 +420,21 @@ For Claude Desktop, add the environment variable to your config:
 }
 ```
 
+### Lean profile
+
+```bash
+export ABLETON_MCP_LEAN_PROFILE=true
+```
+
+The lean profile is for deployments that drive Live purely as a control path and never use the dataset side plane. It goes further than the disable switches above: with it set, the server
+
+- never imports the dataset/telemetry modules — the tool decorators are pass-throughs, no passive poller can start, and no Supabase client is constructed;
+- keeps the dataset tools registered, and they answer exactly as they do when recording is disabled;
+- returns tool results as compact JSON instead of pretty-printed JSON (the same JSON value, without `indent=2`);
+- logs command names and byte counts at INFO instead of full command parameters.
+
+Leave it unset for the default profile, which is unchanged.
+
 ---
 
 ## Join the Community
