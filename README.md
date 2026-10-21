@@ -335,7 +335,8 @@ every chunk - quadratic in the message size (~61x the one-shot parse
 cost at 1 MiB, ~133x at 2 MiB, measured on both endpoints; see the
 benchmark below). Framing v2 sends the same JSON object as one
 length-prefixed frame - a 4-byte big-endian payload length plus the
-UTF-8 payload, at most the same 16 MiB - decoded incrementally, with a
+UTF-8 payload, at most the same 16 MiB (exactly 16 MiB included) -
+decoded incrementally, with a
 native `request_id` in every payload for exact correlation (the
 MCP-01 echo/timing mechanism, not a second one).
 
@@ -345,8 +346,9 @@ handshake; the MCP server switches a connection to framed exchanges
 only after that advertisement, and the script decides each message's
 framing at its boundary and answers in kind - so a session opens with
 the v1 handshake and frames everything after it, while a v1 client
-sees byte-identical v1 behaviour. An oversized or malformed frame is
-answered with a framed error and a closed connection, never a hang.
+sees byte-identical v1 behaviour. A frame announcing more than
+16 MiB, or a malformed payload, is answered with a framed error and a
+closed connection, never a hang.
 From Python nothing changes: `send_command` / `send_batch` frame
 transparently once negotiated, and `last_timing` is populated on
 every v2 exchange.

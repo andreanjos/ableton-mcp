@@ -245,6 +245,29 @@ def test_v2_oversized_frame_gets_a_framed_error_not_a_hang(
     assert client.closed is True
 
 
+def test_v2_max_size_frame_is_dispatched_and_answered_framed(script_module):
+    """N == MAX_FRAME_BYTES exactly: the one legal length whose prefix
+    (01 00 00 00) does not start with 0x00. The sniffer must still
+    decide v2 - the range check is the decoder's - the command must
+    dispatch, and the reply must be a frame."""
+    base = json.dumps({"type": "get_session_info",
+                       "params": {"pad": ""}}).encode("utf-8")
+    pad = MAX_FRAME_BYTES - len(base)
+    payload = json.dumps({"type": "get_session_info",
+                          "params": {"pad": "x" * pad}}).encode("utf-8")
+    assert len(payload) == MAX_FRAME_BYTES == 16777216
+    framed = encode_frame(payload)
+    assert framed[:4] == b"\x01\x00\x00\x00"
+    chunks = [framed[i:i + 65536] for i in range(0, len(framed), 65536)]
+    _inst, received, client = _serve(script_module, chunks)
+    assert [c["type"] for c in received] == ["get_session_info"]
+    assert len(received[0]["params"]["pad"]) == pad
+    replies = _decode_frames(client.sent)
+    assert replies == [{"status": "success",
+                        "result": {"echo": "get_session_info"}}]
+    assert client.closed is True
+
+
 def test_v2_invalid_json_payload_gets_a_framed_error(script_module):
     _inst, received, client = _serve(script_module,
                                      [encode_frame(b"this is not json")])

@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import struct
 
-#: Frame payload ceiling: the v1 request ceiling, reused so a message
-#: that was legal in v1 is legal in v2 at exactly the same size.
+#: Frame payload ceiling: the v1 request ceiling, reused so the size
+#: limit is identical in both framings, boundary included: a payload
+#: of exactly this size is legal in v2, as a whole request of this
+#: size is in v1.
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 
 #: Smallest legal payload: "{}".

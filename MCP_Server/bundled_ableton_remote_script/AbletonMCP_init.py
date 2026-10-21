@@ -338,9 +338,11 @@ class AbletonMCP(ControlSurface):
         is the exchange that advertises v2 - followed by framed
         exchanges on the same connection, but the boundary rule is
         uniform, and a v1 client talking to this script sees v1
-        unchanged. Bytes that start neither protocol close the
-        connection without a reply: there is no framing in which an
-        error could be sent.
+        unchanged. Bytes that start neither protocol end the
+        connection: before any message they close it without a reply
+        (there is no framing in which an error could be sent); after
+        an exchange they first draw an error reply in that exchange's
+        framing, which the handler still holds.
         """
         self.log_message("Client handler started")
         client.settimeout(None)  # No timeout for client socket
@@ -439,7 +441,8 @@ class AbletonMCP(ControlSurface):
                     # than carry on out of step with the client. The report is
                     # written in the framing of the message being answered -
                     # when one was established; unsniffed garbage gets no
-                    # reply, because there is no framing to express one in.
+                    # reply only before the first message, because after
+                    # an exchange the retained framing can express one.
                     if framing is not None:
                         error_response = {
                             "status": "error",
@@ -468,9 +471,11 @@ class AbletonMCP(ControlSurface):
         recognised by its first non-whitespace byte being '{' (v1's
         json.loads tolerates leading whitespace, so a padded v1
         request still detects as v1); v2 by a 4-byte big-endian length
-        prefix. Every legal length (<= 16 MiB) makes the prefix start
-        with a 0x00 byte, and '{' can never start a length prefix, so
-        the two are unambiguous from the first byte on. The length
+        prefix. A legal length (<= 16 MiB) makes the prefix start
+        with a 0x00 byte - except exactly 16 MiB, whose prefix is
+        01 00 00 00 - so the candidate first bytes are 0x00 and 0x01,
+        and '{' can never start a length prefix: the two are
+        unambiguous from the first byte on. The decoded length
         itself is the decoder's to validate: handing an out-of-range
         prefix to it produces the precise framed error ("Invalid frame
         length ...") instead of a silent close here.
@@ -487,7 +492,7 @@ class AbletonMCP(ControlSurface):
             raise ValueError(
                 "Unrecognised framing: a frame length prefix may not "
                 "follow whitespace")
-        if buffer[0:1] != b"\x00":
+        if buffer[0:1] not in (b"\x00", b"\x01"):
             raise ValueError(
                 "Unrecognised framing: first byte is neither '{' nor "
                 "the start of a frame length prefix")

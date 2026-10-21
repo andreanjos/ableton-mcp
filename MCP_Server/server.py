@@ -232,6 +232,10 @@ class AbletonConnection:
         # caller did not supply one - so each framed response correlates
         # exactly with its request, and the echo verification (and the
         # agent0_timing capture) below runs for every v2 exchange.
+        # Correlation is a per-exchange echo check under the connection
+        # lock, not a session-unique id registry: native allocation
+        # counts only its own ids, so it can reissue a value a caller
+        # supplied explicitly earlier in the session.
         if request_id is None and self._framing_v2:
             request_id = self._next_request_id
             self._next_request_id += 1
