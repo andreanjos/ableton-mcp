@@ -4,13 +4,16 @@ Measures, without Ableton Live, the three protocol-level costs the lane
 audit quantified ad hoc, so future performance PRs can paste a
 before/after table produced by this script:
 
-  A. Framing / repeated-parse cost. Both fork endpoints receive by
-     re-joining and re-parsing the whole accumulated buffer after every
-     8192-byte chunk. Section A runs the *exact* fork receive code
-     (``AbletonConnection.receive_full_response`` on the server side,
-     ``AbletonMCP._handle_client`` on the Remote Script side) against
-     fake sockets delivering fixed 8192-byte chunks, beside a one-shot
-     ``json.loads`` of the same bytes.
+  A. Framing / repeated-parse cost. Under protocol v1 both fork
+     endpoints receive by re-joining and re-parsing the whole
+     accumulated buffer after every 8192-byte chunk. Section A runs
+     the *exact* fork receive code (``AbletonConnection``'s v1
+     ``receive_full_response`` and its MCP-03 ``_receive_framed_response``
+     on the server side, ``AbletonMCP._handle_client`` speaking v1 and
+     v2 on the Remote Script side) against fake sockets delivering
+     fixed 8192-byte chunks, beside a one-shot ``json.loads`` of the
+     same bytes. The v2 columns are the after picture for MCP-03: the
+     same payload as one length-prefixed frame, parsed incrementally.
 
   B. Round trips per composite workflow. A fake TCP peer speaking
      protocol v1 counts requests and connections while a real
@@ -105,6 +108,7 @@ class _FakeSocket:
 
 
 def bench_server_receive():
+    from MCP_Server.framing import encode_frame
     from MCP_Server.server import AbletonConnection
     conn = AbletonConnection("127.0.0.1", 9)
     rows = []
@@ -114,12 +118,20 @@ def bench_server_receive():
         repeated = _median_ms(
             lambda: conn.receive_full_response(_FakeSocket(payload)),
             _reps_for(size))
+        framed = encode_frame(payload)
+
+        def receive_v2():
+            data = conn._receive_framed_response(_FakeSocket(framed))
+            return json.loads(data.decode("utf-8"))
+        v2 = _median_ms(receive_v2, _reps_for(size))
         one_shot = _median_ms(lambda: json.loads(payload.decode("utf-8")),
                               _reps_for(size))
         rows.append({"bytes": size, "chunks": -(-size // CHUNK),
                      "repeated_parse_ms": repeated,
                      "one_shot_ms": one_shot,
-                     "ratio": repeated / one_shot if one_shot else float("nan")})
+                     "ratio": repeated / one_shot if one_shot else float("nan"),
+                     "v2_ms": v2,
+                     "v2_ratio": v2 / one_shot if one_shot else float("nan")})
     return rows
 
 
@@ -188,13 +200,27 @@ def bench_remote_receive():
                 "status": "success", "result": {}}
             inst._handle_client(_FakeClient(payload))
 
+        framed = module._encode_frame(payload)
+
+        def run_once_v2():
+            inst = module.AbletonMCP.__new__(module.AbletonMCP)
+            inst.log_message = lambda *a, **k: None
+            inst.show_message = lambda *a, **k: None
+            inst.running = True
+            inst._process_command = lambda command: {
+                "status": "success", "result": {}}
+            inst._handle_client(_FakeClient(framed))
+
         repeated = _median_ms(run_once, _reps_for(size))
+        v2 = _median_ms(run_once_v2, _reps_for(size))
         one_shot = _median_ms(lambda: json.loads(payload.decode("utf-8")),
                               _reps_for(size))
         rows.append({"bytes": size, "chunks": -(-size // CHUNK),
                      "repeated_parse_ms": repeated,
                      "one_shot_ms": one_shot,
-                     "ratio": repeated / one_shot if one_shot else float("nan")})
+                     "ratio": repeated / one_shot if one_shot else float("nan"),
+                     "v2_ms": v2,
+                     "v2_ratio": v2 / one_shot if one_shot else float("nan")})
     return rows
 
 
@@ -502,13 +528,13 @@ def bench_snapshot_model():
 
 def _print_parse_table(title, rows):
     print(title)
-    print("  %10s %7s %18s %12s %8s" % ("bytes", "chunks",
-                                        "repeated-parse ms", "one-shot ms",
-                                        "ratio"))
+    print("  %10s %7s %14s %13s %12s %8s %8s" % (
+        "bytes", "chunks", "v1 reparse ms", "v2 framed ms", "one-shot ms",
+        "v1 ratio", "v2 ratio"))
     for r in rows:
-        print("  %10d %7d %18.3f %12.3f %7.1fx" % (
-            r["bytes"], r["chunks"], r["repeated_parse_ms"],
-            r["one_shot_ms"], r["ratio"]))
+        print("  %10d %7d %14.3f %13.3f %12.3f %7.1fx %7.2fx" % (
+            r["bytes"], r["chunks"], r["repeated_parse_ms"], r["v2_ms"],
+            r["one_shot_ms"], r["ratio"], r["v2_ratio"]))
     print()
 
 
@@ -539,7 +565,8 @@ def main(argv=None):
 
     print("AbletonMCP headless protocol benchmark (no Live; fake peers)\n")
     _print_parse_table(
-        "A1. Server receive path - AbletonConnection.receive_full_response:",
+        "A1. Server receive path - v1 receive_full_response vs "
+        "MCP-03 _receive_framed_response:",
         results["server_receive"])
     _print_parse_table(
         "A2. Remote request path - AbletonMCP._handle_client "

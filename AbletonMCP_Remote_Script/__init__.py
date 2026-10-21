@@ -8,6 +8,7 @@ import json
 import threading
 import time
 import traceback
+import struct
 
 # Change queue import for Python 2
 try:
@@ -34,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.3"
+SCRIPT_VERSION = "1.7.4"
 PROTOCOL_VERSION = 1
 
 # Complete command surface of the _process_command dispatcher, kept sorted.
@@ -91,6 +92,17 @@ MAX_REQUEST_ID = 9007199254740991
 # capped far below what the 16 MiB request ceiling alone would allow.
 MAX_BATCH_COMMANDS = 1000
 
+# MCP-03 framing v2: a request (and its response) may travel as one
+# length-prefixed frame - 4-byte big-endian payload length + the UTF-8
+# JSON payload - instead of v1's raw single JSON object. The payload
+# ceiling is MAX_REQUEST_BYTES, the same 16 MiB v1 allows a whole
+# request. Support is advertised in the handshake (agent0_framing);
+# framing is sniffed at every message boundary and a peer is always
+# answered in the framing its message used, so a v1 handshake can be
+# followed by framed exchanges on the same connection and v1 clients
+# are unaffected. The canonical codec description lives in
+# MCP_Server/framing.py.
+
 
 def _is_valid_request_id(value):
     """A request_id is an integer in [0, MAX_REQUEST_ID]; bools excluded."""
@@ -120,6 +132,56 @@ def _finish_agent0_timing(response, timing_state):
     }
     if timing_state.get("request_id") is not None:
         response["request_id"] = timing_state["request_id"]
+
+def _encode_frame(payload):
+    """Prefix *payload* (bytes) with its length for framing v2.
+
+    Wire format: 4-byte big-endian payload length + the payload
+    itself. Shared with MCP_Server/framing.py - the script cannot
+    import the package, so the codec lives here in miniature and the
+    two must never drift apart in what they accept.
+    """
+    return struct.pack(">I", len(payload)) + payload
+
+
+class _FrameDecoder(object):
+    """Incremental framing-v2 decoder for one connection.
+
+    feed() appends received bytes; next_frame() pops one complete
+    frame payload, or returns None while only a partial frame is
+    buffered. Consumed bytes are removed from the front of the buffer
+    and each payload is extracted exactly once - the accumulated
+    buffer is never re-parsed - which is the whole point of MCP-03
+    (the audit measured v1's re-parse loop at ~61x the one-shot cost
+    at 1 MiB and ~133x at 2 MiB). Raises ValueError on a declared
+    length outside [2, MAX_REQUEST_BYTES]: after that the stream
+    cannot be resynchronised, so the caller reports it and closes.
+    """
+
+    def __init__(self):
+        self._buffer = bytearray()
+
+    @property
+    def pending(self):
+        """Bytes held toward an incomplete frame."""
+        return len(self._buffer)
+
+    def feed(self, data):
+        self._buffer += data
+
+    def next_frame(self):
+        if len(self._buffer) < 4:
+            return None
+        (length,) = struct.unpack(">I", bytes(self._buffer[:4]))
+        if length < 2 or length > MAX_REQUEST_BYTES:
+            raise ValueError(
+                "Invalid frame length %d (framing v2)" % length)
+        if len(self._buffer) < 4 + length:
+            return None
+        payload = bytes(self._buffer[4:4 + length])
+        del self._buffer[:4 + length]
+        return payload
+
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -263,7 +325,25 @@ class AbletonMCP(ControlSurface):
             self.log_message("Server thread error: " + str(e))
     
     def _handle_client(self, client):
-        """Handle communication with a connected client"""
+        """Handle communication with a connected client.
+
+        MCP-03: framing is a property of each message, decided at
+        every message boundary from the next bytes on the stream:
+        * v1 - the historical raw single JSON object, answered with a
+          raw JSON object;
+        * v2 - one length-prefixed frame (see _FrameDecoder),
+          answered with a frame.
+        A peer is always answered in the framing its message used.
+        The natural session shape is a v1 handshake - get_script_info
+        is the exchange that advertises v2 - followed by framed
+        exchanges on the same connection, but the boundary rule is
+        uniform, and a v1 client talking to this script sees v1
+        unchanged. Bytes that start neither protocol end the
+        connection: before any message they close it without a reply
+        (there is no framing in which an error could be sent); after
+        an exchange they first draw an error reply in that exchange's
+        framing, which the handler still holds.
+        """
         self.log_message("Client handler started")
         client.settimeout(None)  # No timeout for client socket
         # Accumulate raw bytes, never per-chunk text. A multi-byte UTF-8
@@ -272,7 +352,23 @@ class AbletonMCP(ControlSurface):
         # code answered that with an error frame pushed into a stream the
         # client was still reading a real response from — desynchronising the
         # connection for good.
-        buffer = b''
+        buffer = bytearray()  # Received, not yet attributed to a message
+        decoder = _FrameDecoder()  # Holds at most one partial v2 frame
+        framing = None  # Framing of the message currently being answered
+
+        def send_response(response):
+            payload = json.dumps(response).encode('utf-8')
+            if framing == "v2":
+                client.sendall(_encode_frame(payload))
+            else:
+                client.sendall(payload)
+
+        def dispatch(command):
+            self.log_message(
+                "Received command: " + str(command.get("type", "unknown")))
+            # Process the command and send its response, written in the
+            # framing the command arrived in.
+            send_response(self._process_command(command))
 
         try:
             while self.running:
@@ -285,30 +381,56 @@ class AbletonMCP(ControlSurface):
                         self.log_message("Client disconnected")
                         break
 
-                    buffer += data
+                    # A frame in flight owns the stream until it is
+                    # whole; anything else accumulates unattributed.
+                    if decoder.pending:
+                        decoder.feed(data)
+                    else:
+                        buffer += data
 
-                    if len(buffer) > MAX_REQUEST_BYTES:
-                        buffer = b''
-                        raise ValueError(
-                            "Request exceeded %d bytes without a complete JSON command"
-                            % MAX_REQUEST_BYTES)
-
-                    try:
-                        # Only a fully received command decodes and parses.
-                        # Either error means "not all here yet", so wait.
-                        command = json.loads(buffer.decode('utf-8'))
-                    except (ValueError, UnicodeDecodeError):
-                        continue
-
-                    buffer = b''  # Clear buffer after successful parse
-
-                    self.log_message("Received command: " + str(command.get("type", "unknown")))
-
-                    # Process the command and get response
-                    response = self._process_command(command)
-
-                    # Send the response with explicit encoding
-                    client.sendall(json.dumps(response).encode('utf-8'))
+                    # Answer every message the stream now holds whole.
+                    # One recv() may complete a frame, complete a v1
+                    # command, or carry several framed messages.
+                    while True:
+                        if decoder.pending:
+                            payload = decoder.next_frame()
+                            if payload is None:
+                                break  # Partial frame: receive more
+                            framing = "v2"
+                            command = json.loads(payload.decode('utf-8'))
+                            if not isinstance(command, dict):
+                                raise ValueError(
+                                    "Framing v2 payload is not a JSON object")
+                            dispatch(command)
+                            continue
+                        if not buffer:
+                            break  # Nothing attributed: receive more
+                        framing = self._sniff_framing(buffer)
+                        if framing is None:
+                            break  # Partial prefix: receive more
+                        if framing == "v2":
+                            decoder.feed(bytes(buffer))
+                            del buffer[:]
+                            continue
+                        # Framing v1: the historical receive path,
+                        # unchanged - the whole buffer must be the one
+                        # command; a parse failure means "not all here
+                        # yet", never a smaller message boundary.
+                        if len(buffer) > MAX_REQUEST_BYTES:
+                            del buffer[:]
+                            raise ValueError(
+                                "Request exceeded %d bytes without a complete JSON command"
+                                % MAX_REQUEST_BYTES)
+                        try:
+                            # Only a fully received command decodes and
+                            # parses. Either error means "not all here
+                            # yet", so wait.
+                            command = json.loads(
+                                bytes(buffer).decode('utf-8'))
+                        except (ValueError, UnicodeDecodeError):
+                            break
+                        del buffer[:]  # Consume the parsed command
+                        dispatch(command)
 
                 except Exception as e:
                     self.log_message("Error handling client data: " + str(e))
@@ -316,15 +438,20 @@ class AbletonMCP(ControlSurface):
 
                     # Every error that reaches here leaves the request/response
                     # stream in an unknown state, so report it and close rather
-                    # than carry on out of step with the client.
-                    error_response = {
-                        "status": "error",
-                        "message": str(e)
-                    }
-                    try:
-                        client.sendall(json.dumps(error_response).encode('utf-8'))
-                    except Exception:
-                        pass
+                    # than carry on out of step with the client. The report is
+                    # written in the framing of the message being answered -
+                    # when one was established; unsniffed garbage gets no
+                    # reply only before the first message, because after
+                    # an exchange the retained framing can express one.
+                    if framing is not None:
+                        error_response = {
+                            "status": "error",
+                            "message": str(e)
+                        }
+                        try:
+                            send_response(error_response)
+                        except Exception:
+                            pass
                     break
         except Exception as e:
             self.log_message("Error in client handler: " + str(e))
@@ -334,7 +461,45 @@ class AbletonMCP(ControlSurface):
             except:
                 pass
             self.log_message("Client handler stopped")
-    
+
+    @staticmethod
+    def _sniff_framing(buffer):
+        """Decide the framing of the next message from its first bytes.
+
+        Returns "v1", "v2", or None when more bytes are needed; raises
+        ValueError when the bytes can start neither protocol. v1 is
+        recognised by its first non-whitespace byte being '{' (v1's
+        json.loads tolerates leading whitespace, so a padded v1
+        request still detects as v1); v2 by a 4-byte big-endian length
+        prefix. A legal length (<= 16 MiB) makes the prefix start
+        with a 0x00 byte - except exactly 16 MiB, whose prefix is
+        01 00 00 00 - so the candidate first bytes are 0x00 and 0x01,
+        and '{' can never start a length prefix: the two are
+        unambiguous from the first byte on. The decoded length
+        itself is the decoder's to validate: handing an out-of-range
+        prefix to it produces the precise framed error ("Invalid frame
+        length ...") instead of a silent close here.
+        """
+        index = 0
+        while index < len(buffer) and buffer[index:index + 1] in (
+                b" ", b"\t", b"\r", b"\n"):
+            index += 1
+        if index == len(buffer):
+            return None  # Only whitespace so far
+        if buffer[index:index + 1] == b"{":
+            return "v1"
+        if index > 0:
+            raise ValueError(
+                "Unrecognised framing: a frame length prefix may not "
+                "follow whitespace")
+        if buffer[0:1] not in (b"\x00", b"\x01"):
+            raise ValueError(
+                "Unrecognised framing: first byte is neither '{' nor "
+                "the start of a frame length prefix")
+        if len(buffer) < 4:
+            return None  # Length prefix not fully here yet
+        return "v2"
+
     def _batch_inline_active(self):
         """True while an execute_batch task is dispatching on this thread.
 
@@ -788,6 +953,7 @@ class AbletonMCP(ControlSurface):
             "snapshot_schema": "ableton_mcp_snapshot_v2",
             "passive_listeners": True,
             "agent0_request_ids": True,
+            "agent0_framing": ["v1", "v2"],
             "agent0_capabilities_complete": True,
             "agent0_host_revision": 1,
         }

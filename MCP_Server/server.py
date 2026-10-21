@@ -13,6 +13,7 @@ from .telemetry import record_startup
 from .telemetry_decorator import telemetry_tool, rich_telemetry_tool
 from .dataset import dataset_enabled, get_recorder
 from .dataset.trajectory_decorator import trajectory_tool
+from .framing import FrameDecoder, encode_frame
 
 ABLETON_HOST = os.environ.get("ABLETON_HOST", "localhost")
 ABLETON_PORT = int(os.environ.get("ABLETON_PORT", "9877"))
@@ -33,6 +34,15 @@ class AbletonConnection:
     last_timing: Any = None
     last_request_id: Any = None
 
+    # MCP-03: framing negotiated for THIS connection. False = wire v1
+    # (raw JSON, byte-identical to the historical protocol). Flips True
+    # only after a get_script_info result received on this connection
+    # advertises framing v2 (see _note_script_info); reset by connect()
+    # and disconnect(), so a fresh connection always starts at v1 and
+    # re-negotiates from the handshake.
+    _framing_v2: bool = False
+    _next_request_id: int = 1
+
     # One socket, several threads: tool calls run on the MCP worker while the
     # passive poller drains events on its own thread. Serialise so their
     # sendall/recv pairs cannot interleave.
@@ -48,6 +58,8 @@ class AbletonConnection:
             self.sock.settimeout(5.0)
             self.sock.connect((self.host, self.port))
             self.sock.settimeout(None)
+            self._framing_v2 = False
+            self._next_request_id = 1
             logger.info(f"Connected to Ableton at {self.host}:{self.port}")
             return True
         except Exception as e:
@@ -65,6 +77,7 @@ class AbletonConnection:
                     logger.error(f"Error disconnecting from Ableton: {str(e)}")
                 finally:
                     self.sock = None
+                    self._framing_v2 = False
 
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
@@ -112,6 +125,57 @@ class AbletonConnection:
                 raise Exception("Incomplete JSON response received")
         else:
             raise Exception("No data received")
+
+    def _note_script_info(self, result: Any) -> None:
+        """Adopt the framing the connected script advertises (MCP-03).
+
+        Called with the result of every successful get_script_info
+        exchange on this connection. v2 is used only when the result's
+        ``agent0_framing`` list contains "v2"; anything else - an older
+        script, a missing key - keeps (or returns) this connection to
+        v1. The handshake exchange itself is always answered in the
+        framing it was sent in, so adopting its result here affects
+        only later exchanges. A script downgraded under a live
+        connection therefore costs at most one timed-out framed
+        exchange: the error drops the socket, and the reconnect
+        re-negotiates from v1.
+        """
+        framing = result.get("agent0_framing") if isinstance(result, dict) else None
+        self._framing_v2 = isinstance(framing, list) and "v2" in framing
+
+    def _receive_framed_response(self, sock, buffer_size=8192) -> bytes:
+        """Receive exactly one framing-v2 response frame (MCP-03).
+
+        Chunks feed an incremental FrameDecoder and the completed
+        payload is parsed once by the caller; the accumulated buffer
+        is never re-parsed (the v1 path's quadratic cost, measured at
+        ~61x one-shot at 1 MiB and ~133x at 2 MiB). Raises on EOF, on
+        an invalid/oversized frame, and on any trailing bytes: the
+        script answers one request with exactly one frame, so extra
+        data means the stream is desynchronised and the caller must
+        drop the connection. Unlike receive_full_response this does
+        NOT touch the socket timeout - the caller sets the per-command
+        budget, so v2 exchanges honour it.
+        """
+        decoder = FrameDecoder()
+        while True:
+            payload = decoder.next_frame()
+            if payload is not None:
+                break
+            chunk = sock.recv(buffer_size)
+            if not chunk:
+                if decoder.pending_bytes:
+                    raise Exception(
+                        "Connection closed mid-frame (%d bytes buffered)"
+                        % decoder.pending_bytes)
+                raise Exception("Connection closed before receiving any data")
+            decoder.feed(chunk)
+        if decoder.pending_bytes:
+            raise Exception(
+                "Remote Script sent %d trailing bytes after the response "
+                "frame; connection desynchronised" % decoder.pending_bytes)
+        logger.info(f"Received complete framed response ({len(payload)} bytes)")
+        return payload
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None, request_id: int = None) -> Dict[str, Any]:
         """Send a command to Ableton and return the response.
@@ -163,6 +227,21 @@ class AbletonConnection:
             "params": params or {}
         }
 
+        # MCP-03: on a connection that negotiated framing v2, every
+        # request carries a native request_id - allocated here when the
+        # caller did not supply one - so each framed response correlates
+        # exactly with its request, and the echo verification (and the
+        # agent0_timing capture) below runs for every v2 exchange.
+        # Correlation is a per-exchange echo check under the connection
+        # lock, not a session-unique id registry: native allocation
+        # counts only its own ids, so it can reissue a value a caller
+        # supplied explicitly earlier in the session.
+        if request_id is None and self._framing_v2:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            if self._next_request_id > 9007199254740991:
+                self._next_request_id = 1
+
         # MCP-01 (opt-in): attach a request id only when the caller asked
         # for one. The Remote Script echoes it and adds an agent0_timing
         # block; without request_id the wire request is unchanged.
@@ -196,8 +275,14 @@ class AbletonConnection:
         try:
             logger.info(f"Sending command: {command_type} with params: {params}")
             
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
+            # Send the command. Under framing v2 the same JSON bytes
+            # travel length-prefixed; the script answers in whichever
+            # framing the request used, so this choice is per-connection
+            # state, never a guess about the peer.
+            request_bytes = json.dumps(command).encode('utf-8')
+            if self._framing_v2:
+                request_bytes = encode_frame(request_bytes)
+            self.sock.sendall(request_bytes)
             logger.info(f"Command sent, waiting for response...")
             
             # Set timeout based on command type
@@ -224,7 +309,10 @@ class AbletonConnection:
             self.sock.settimeout(timeout)
 
             # Receive the response
-            response_data = self.receive_full_response(self.sock)
+            if self._framing_v2:
+                response_data = self._receive_framed_response(self.sock)
+            else:
+                response_data = self.receive_full_response(self.sock)
             logger.info(f"Received {len(response_data)} bytes of data")
 
             # Parse the response
@@ -244,6 +332,11 @@ class AbletonConnection:
                             request_id, response.get("request_id")))
                 self.last_timing = response.get("agent0_timing")
                 self.last_request_id = request_id
+
+            if command_type == "get_script_info":
+                # MCP-03 negotiation: this handshake's advertisement
+                # decides the framing of the NEXT exchange.
+                self._note_script_info(response.get("result"))
 
             return response.get("result", {})
         except socket.timeout:
