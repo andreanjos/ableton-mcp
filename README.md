@@ -428,7 +428,7 @@ export ABLETON_MCP_LEAN_PROFILE=true
 
 The lean profile is for deployments that drive Live purely as a control path and never use the dataset side plane. It goes further than the disable switches above: with it set, the server
 
-- never imports the dataset/telemetry modules — the tool decorators are pass-throughs, no passive poller can start, and no Supabase client is constructed;
+- does not import the dataset/telemetry modules at startup, and nothing on the tool-call control path imports them — the tool decorators are pass-throughs, no passive poller can start, and no Supabase client is constructed; the one exception is `set_dataset_consent`, which imports `dataset.consent` to persist the user's answer — that loads the modules without activating any recording behaviour;
 - keeps the dataset tools registered, and they answer exactly as they do when recording is disabled;
 - returns tool results as compact JSON instead of pretty-printed JSON (the same JSON value, without `indent=2`);
 - logs command names and byte counts at INFO instead of full command parameters.

@@ -22,10 +22,14 @@ def _env_flag(name: str) -> bool:
 # For deployments that drive Live purely as a control path (the Omnicorp
 # profile) and never use the dataset side plane. Where the
 # ABLETON_MCP_DISABLE_* switches merely gate the telemetry/dataset
-# machinery off, the lean profile leaves it unwired entirely: this
-# module never imports it, the tool decorators are pass-throughs, the
+# machinery off, the lean profile leaves it unwired: the side-plane
+# modules are not imported at startup, and nothing on the tool-call
+# control path imports them — the tool decorators are pass-throughs, the
 # passive poller cannot start, and no Supabase client is constructed.
-# Tool results switch from pretty-printed JSON to compact JSON, and
+# The one exception is set_dataset_consent below: persisting the user's
+# answer imports dataset.consent, which loads the side-plane modules
+# without activating any recording behaviour. Tool results switch from
+# pretty-printed JSON to compact JSON, and
 # INFO logs carry command names and byte counts instead of full
 # parameters. With the variable unset the default profile is unchanged
 # in every observable way.
