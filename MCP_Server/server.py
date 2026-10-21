@@ -124,6 +124,36 @@ class AbletonConnection:
         with self._lock:
             return self._send_command_locked(command_type, params, request_id)
 
+    def send_batch(self, commands: List[Dict[str, Any]],
+                   stop_on_error: bool = False,
+                   request_id: int = None) -> Dict[str, Any]:
+        """Send an ordered list of commands as ONE execute_batch exchange.
+
+        ``commands`` is a list of wire items, ``{"type": ..., "params":
+        {...}}`` (``params`` optional per item). The Remote Script runs
+        them in order inside a single main-thread scheduling and replies
+        once, so the whole list costs one socket round trip. Returns the
+        batch result: ``{"results": [...], "summary": {...}}``, where
+        each entry of ``results`` is the response envelope a direct
+        ``send_command`` of that item would have produced (or a
+        ``{"status": "skipped", ...}`` marker under ``stop_on_error``).
+
+        A failed item does NOT raise here - inspect the per-item
+        envelopes. This raises only when the batch exchange itself
+        fails (batch-level error envelope, timeout, connection loss),
+        like send_command. Batching is sequencing, not a transaction:
+        a failed item does not roll back the items before it. Requires
+        a Remote Script whose handshake advertises ``execute_batch``
+        (script 1.7.3+); older scripts answer "Unknown command".
+        """
+        if not isinstance(commands, list):
+            raise ValueError(
+                "commands must be a list of {'type', 'params'} items")
+        params = {"commands": commands,
+                  "stop_on_error": bool(stop_on_error)}
+        return self.send_command("execute_batch", params,
+                                 request_id=request_id)
+
     def _send_command_locked(self, command_type: str, params: Dict[str, Any] = None, request_id: int = None) -> Dict[str, Any]:
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Ableton")
@@ -143,7 +173,7 @@ class AbletonConnection:
             command["request_id"] = request_id
         
         # Check if this is a state-modifying command
-        is_modifying_command = command_type in [
+        modifying_commands = [
             "create_midi_track", "create_audio_track", "set_track_name",
             "create_clip", "create_audio_clip", "add_notes_to_clip", "set_clip_name",
             "delete_clip",
@@ -155,6 +185,7 @@ class AbletonConnection:
             "duplicate_session_clip_to_arrangement",
             "create_locator"
         ]
+        is_modifying_command = command_type in modifying_commands
 
         # Commands whose work on Live's main thread can take noticeably longer
         # than the default modifying-command budget (e.g. importing/decoding a
@@ -172,6 +203,22 @@ class AbletonConnection:
             # Set timeout based on command type
             if command_type in long_running_commands:
                 timeout = long_running_commands[command_type]
+            elif command_type == "execute_batch":
+                # One exchange whose script-side work is the sum of its
+                # items: budget like sending them one by one, so a long
+                # batch is not cut off at a single command's budget.
+                timeout = 0.0
+                batch_params = params if isinstance(params, dict) else {}
+                for batch_item in batch_params.get("commands") or []:
+                    item_type = (batch_item.get("type")
+                                 if isinstance(batch_item, dict) else None)
+                    if item_type == "create_audio_clip":
+                        timeout += 65.0
+                    elif item_type in modifying_commands:
+                        timeout += 15.0
+                    else:
+                        timeout += 10.0
+                timeout = max(timeout, 15.0)
             else:
                 timeout = 15.0 if is_modifying_command else 10.0
             self.sock.settimeout(timeout)
