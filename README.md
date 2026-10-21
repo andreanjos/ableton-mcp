@@ -289,6 +289,29 @@ The system uses a simple JSON-based protocol over TCP sockets:
 - **Commands** are sent as JSON objects with a `type` and optional `params`
 - **Responses** are JSON objects with a `status` and `result` or `message`
 
+### Per-command timing (opt-in)
+
+A command that carries an integer `request_id` (0 to 9007199254740991), or
+`"timing": true`, gets two additions on its response envelope: the echoed
+`request_id` and an `agent0_timing` block with `dispatch_ms` (total time in
+the Remote Script dispatcher), `queue_ms` (wait for the Live main thread;
+`null` for commands that run directly) and `execution_ms` (time on the main
+thread; `null` likewise). Commands that do not opt in are answered exactly
+as before - no extra keys, no timing overhead. The handshake
+(`get_script_info`) advertises the complete dispatcher-derived capability
+list and the `agent0_request_ids` / `agent0_capabilities_complete` markers.
+From Python, `AbletonConnection.send_command(type, params, request_id=n)`
+attaches an id, verifies the echo, and exposes the timing block as
+`connection.last_timing`.
+
+### Benchmark
+
+`ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
+runs a headless protocol benchmark - no Live required: the repeated-parse
+framing cost on both endpoints against fake sockets, round-trip counts for
+representative composite workflows against a fake TCP peer, and a synthetic
+snapshot serialisation model. Add `--json` for machine-readable output.
+
 ## Limitations & Security Considerations
 
 - Creating complex musical arrangements might need to be broken down into smaller steps
