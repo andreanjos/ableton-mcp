@@ -35,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.5"
+SCRIPT_VERSION = "1.7.6"
 PROTOCOL_VERSION = 1
 
 # Complete command surface of the _process_command dispatcher, kept sorted.
@@ -75,6 +75,7 @@ SCRIPT_CAPABILITIES = [
     "set_clip_name",
     "set_current_song_time",
     "set_device_parameter",
+    "set_device_parameters",
     "set_tempo",
     "set_track_name",
     "start_playback",
@@ -91,6 +92,12 @@ MAX_REQUEST_ID = 9007199254740991
 # A batch holds Live's main thread for its whole duration, so the list is
 # capped far below what the 16 MiB request ceiling alone would allow.
 MAX_BATCH_COMMANDS = 1000
+
+# MCP-06: largest parameter list set_device_parameters will apply in
+# one scheduling. Each item is a single attribute write, but the list
+# still holds Live's main thread for its whole duration, so it is
+# capped on the same rationale as MAX_BATCH_COMMANDS.
+MAX_BULK_PARAMETERS = 1000
 
 # MCP-03 framing v2: a request (and its response) may travel as one
 # length-prefixed frame - 4-byte big-endian payload length + the UTF-8
@@ -767,7 +774,16 @@ class AbletonMCP(ControlSurface):
             elif command_type == "get_device_parameters":
                 track_index = params.get("track_index", 0)
                 device_index = params.get("device_index", 0)
-                response["result"] = self._get_device_parameters(track_index, device_index)
+                # MCP-06: subset selection is opt-in; forward only the
+                # selectors the caller actually sent, so an unsubsetted
+                # call is exactly the pre-subset one (and a script
+                # without the subset form simply never sees them).
+                subset_kwargs = {}
+                for key in ("parameter_indices", "parameter_names"):
+                    if key in params:
+                        subset_kwargs[key] = params[key]
+                response["result"] = self._get_device_parameters(
+                    track_index, device_index, **subset_kwargs)
             elif command_type == "get_session_snapshot":
                 include_notes = params.get("include_notes", True)
                 include_params = params.get("include_params", True)
@@ -818,6 +834,16 @@ class AbletonMCP(ControlSurface):
                 except queue.Empty:
                     response["status"] = "error"
                     response["message"] = "Timeout waiting for operation to complete"
+            elif command_type == "set_device_parameters":
+                # MCP-06: apply the whole parameter list inside one
+                # main-thread scheduling (see _set_device_parameters).
+                bulk_response = self._set_device_parameters(params, timing_state)
+                if bulk_response.get("status") == "error":
+                    response["status"] = "error"
+                    response["message"] = bulk_response.get(
+                        "message", "Bulk parameter set failed")
+                else:
+                    response["result"] = bulk_response.get("result", {})
             else:
                 response["status"] = "error"
                 response["message"] = "Unknown command: " + command_type
@@ -2675,7 +2701,18 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error getting clip notes: " + str(e))
             raise
 
-    def _get_device_parameters(self, track_index, device_index):
+    def _get_device_parameters(self, track_index, device_index,
+                               parameter_indices=None, parameter_names=None):
+        """Read one device's parameters, optionally a subset (MCP-06).
+
+        With neither selector given this is exactly the pre-subset
+        read. With ``parameter_indices`` and/or ``parameter_names``
+        given, every ``parameters`` list in the returned device tree
+        (the device itself and any devices nested in its chains) keeps
+        only the entries whose index or name was requested - the union
+        when both selectors are given; selectors that match nothing
+        simply contribute nothing. Per-entry shape is unchanged.
+        """
         try:
             if track_index < 0 or track_index >= len(self._song.tracks):
                 raise IndexError("Track index out of range")
@@ -2683,13 +2720,41 @@ class AbletonMCP(ControlSurface):
             if device_index < 0 or device_index >= len(track.devices):
                 raise IndexError("Device index out of range")
             device = track.devices[device_index]
+            info = self._serialize_device(device, device_index, include_params=True)
+            if parameter_indices is not None or parameter_names is not None:
+                wanted_indices = set()
+                for entry in parameter_indices or ():
+                    try:
+                        wanted_indices.add(int(entry))
+                    except (TypeError, ValueError):
+                        continue
+                wanted_names = set(parameter_names or ())
+                info = self._filter_device_parameters(
+                    info, wanted_indices, wanted_names)
             return {
                 "track_index": track_index,
-                "device": self._serialize_device(device, device_index, include_params=True),
+                "device": info,
             }
         except Exception as e:
             self.log_message("Error getting device parameters: " + str(e))
             raise
+
+    def _filter_device_parameters(self, info, wanted_indices, wanted_names):
+        """Restrict every ``parameters`` list in a serialised device
+        tree to the entries whose index or name was requested (MCP-06
+        subset reads). Entry dicts are kept whole, in song order."""
+        params = info.get("parameters")
+        if isinstance(params, list):
+            info["parameters"] = [
+                entry for entry in params
+                if entry.get("index") in wanted_indices
+                or entry.get("name") in wanted_names
+            ]
+        for chain in info.get("chains") or ():
+            for nested in chain.get("devices") or ():
+                self._filter_device_parameters(
+                    nested, wanted_indices, wanted_names)
+        return info
 
     def _get_session_snapshot(self, include_notes=True, include_params=True,
                               track_indices=None, include_scenes=True,
@@ -2839,6 +2904,161 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error setting device parameter: " + str(e))
             raise
+
+    def _set_device_parameters(self, params, timing_state=None):
+        """Apply a list of parameter writes to ONE device (MCP-06).
+
+        The wire command ``set_device_parameters`` takes
+        ``track_index``, ``device_index`` and ``parameters``: a list of
+        items, each ``{"parameter_index": i, "value": v}`` - an item
+        may address by ``name`` instead of ``parameter_index`` (the
+        name is resolved against the device's parameters first, then
+        set by index), and ``parameter_index`` wins when both are
+        given. An optional ``stop_on_error`` (default False) mirrors
+        execute_batch.
+
+        Every item is applied through _set_device_parameter itself, so
+        clamping, value conversion and error conditions are the single
+        set's, item for item, and each item that reaches the set
+        produces exactly the envelope a direct set_device_parameter
+        call would have produced: ``{"status": "success",
+        "result": {...}}`` (the single set's own result, old/new values
+        included) or ``{"status": "error", "result": {},
+        "message": ...}``. Items that never reach the set (malformed,
+        unaddressable, unknown name) get batch-style ``{"status":
+        "error", "message": ...}`` markers. One bad item does not
+        block the others; with stop_on_error the remaining items are
+        reported as ``{"status": "skipped", ...}`` - never silently
+        dropped. The success result is ``{"results": [...],
+        "summary": {"total": n, "succeeded": n, "failed": n,
+        "skipped": n}}``, mirroring execute_batch.
+
+        This is a sequencing primitive, NOT a transaction: items apply
+        in order and a failed item does not roll back the items before
+        it. The whole list runs inside ONE schedule_message hop.
+        """
+        if not isinstance(params, dict):
+            return {"status": "error",
+                    "message": "set_device_parameters requires an object of params"}
+        items = params.get("parameters")
+        if not isinstance(items, list):
+            return {"status": "error",
+                    "message": "set_device_parameters requires a 'parameters' list"}
+        if len(items) > MAX_BULK_PARAMETERS:
+            return {"status": "error",
+                    "message": "set_device_parameters accepts at most %d parameter items"
+                               % MAX_BULK_PARAMETERS}
+        track_index = params.get("track_index", 0)
+        device_index = params.get("device_index", 0)
+        stop_on_error = bool(params.get("stop_on_error", False))
+
+        response_queue = queue.Queue()
+
+        def bulk_task():
+            results = []
+            succeeded = 0
+            failed = 0
+            skipped = 0
+            try:
+                halted = False
+                for item in items:
+                    if halted:
+                        results.append({
+                            "status": "skipped",
+                            "message": "Skipped: stop_on_error after "
+                                       "a failed item",
+                        })
+                        skipped += 1
+                        continue
+                    item_response = self._apply_parameter_item(
+                        track_index, device_index, item)
+                    results.append(item_response)
+                    if item_response.get("status") == "error":
+                        failed += 1
+                        if stop_on_error:
+                            halted = True
+                    else:
+                        succeeded += 1
+            except Exception as e:
+                self.log_message("Error in bulk parameter task: " + str(e))
+                self.log_message(traceback.format_exc())
+                response_queue.put({"status": "error", "message": str(e)})
+                return
+            response_queue.put({"status": "success", "result": {
+                "results": results,
+                "summary": {"total": len(items),
+                            "succeeded": succeeded,
+                            "failed": failed,
+                            "skipped": skipped},
+            }})
+
+        self._schedule_main_thread_task(bulk_task, timing_state)
+
+        # The list may legitimately take as long as its items could
+        # have taken one by one: mirror the batch queue budget.
+        try:
+            return response_queue.get(timeout=max(10.0 * len(items), 10.0))
+        except queue.Empty:
+            return {"status": "error",
+                    "message": "Timeout waiting for bulk parameter set to complete"}
+
+    def _apply_parameter_item(self, track_index, device_index, item):
+        """Apply one set_device_parameters item via the single set.
+
+        The item's outcome is exactly the envelope a direct
+        set_device_parameter call for the same write would produce:
+        the single set's own result on success, its error message on
+        failure. Name resolution is the only pre-step: an item with a
+        ``name`` and no ``parameter_index`` is resolved to that
+        parameter's index, then set by index like any direct call. An
+        item without a usable address is a per-item error, never a
+        silent no-op. A missing ``value`` takes the single set's own
+        dispatcher default (0.0).
+        """
+        if not isinstance(item, dict):
+            return {"status": "error",
+                    "message": "Parameter items must be objects with "
+                               "'parameter_index' (or 'name') and 'value'"}
+        parameter_index = item.get("parameter_index")
+        if parameter_index is None:
+            name = item.get("name")
+            if name is None:
+                return {"status": "error",
+                        "message": "Parameter item requires "
+                                   "'parameter_index' or 'name'"}
+            try:
+                parameter_index = self._parameter_index_by_name(
+                    track_index, device_index, name)
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+        try:
+            result = self._set_device_parameter(
+                track_index, device_index, parameter_index,
+                item.get("value", 0.0))
+            return {"status": "success", "result": result}
+        except Exception as e:
+            # Exactly the envelope a direct set_device_parameter call
+            # produces for the same failure: the dispatcher initialises
+            # "result" before routing and leaves it in place on error.
+            return {"status": "error", "result": {}, "message": str(e)}
+
+    def _parameter_index_by_name(self, track_index, device_index, name):
+        """Index of the device parameter called ``name`` (first match).
+
+        Raises with the single set's own messages when the track or
+        device index is out of range, so a name-addressed item fails
+        exactly as the equivalent direct call would.
+        """
+        if track_index < 0 or track_index >= len(self._song.tracks):
+            raise IndexError("Track index out of range")
+        track = self._song.tracks[track_index]
+        if device_index < 0 or device_index >= len(track.devices):
+            raise IndexError("Device index out of range")
+        device = track.devices[device_index]
+        for index, param in enumerate(device.parameters):
+            if param.name == name:
+                return index
+        raise ValueError("Parameter not found: " + str(name))
 
     def get_browser_tree(self, category_type="all"):
         """

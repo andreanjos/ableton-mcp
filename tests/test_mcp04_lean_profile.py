@@ -308,7 +308,7 @@ def test_default_profile_wraps_tools(default_profile):
 # ------------------------------------------------------------- lean profile
 
 def test_lean_catalog_identical_to_default(default_profile, lean_profile):
-    assert len(lean_profile["catalog"]) == 37
+    assert len(lean_profile["catalog"]) == 38  # 37 base tools + set_device_parameters
     # Names, descriptions and parameter schemas all identical.
     assert lean_profile["catalog"] == default_profile["catalog"]
 

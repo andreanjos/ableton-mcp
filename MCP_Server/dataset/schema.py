@@ -64,6 +64,7 @@ ACTION_CATEGORIES = {
     "add_notes_to_clip": "edit_midi",
     "set_tempo": "mix",
     "set_device_parameter": "mix",
+    "set_device_parameters": "mix",
     "fire_clip": "transport",
     "stop_clip": "transport",
     "start_playback": "transport",

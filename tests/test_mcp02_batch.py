@@ -254,7 +254,7 @@ def test_batch_advertised_in_handshake(script_module):
     assert "execute_batch" in script_module.SCRIPT_CAPABILITIES
     info = inst._get_script_info()
     assert "execute_batch" in info["capabilities"]
-    assert info["script_version"] == "1.7.5"
+    assert info["script_version"] == "1.7.6"
 
 
 # ------------------------------------------------------- server side
