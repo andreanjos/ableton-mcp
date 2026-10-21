@@ -563,6 +563,44 @@ state (including the framing-v2 adoption), so the next command
 reconnects and re-negotiates from v1 instead of inheriting a
 half-open connection.
 
+### Dispatch thread classes
+
+Every command in the Remote Script's dispatcher carries a thread
+class in the script's `COMMAND_TABLE` - the single source from which
+the handshake `capabilities` list is also derived, so the two can
+never drift apart:
+
+- **main** (27 commands): the handler touches the Live object model,
+  so the command is dispatched through one main-thread scheduling
+  and the caller waits on a response queue. The MCP-10 audit
+  classified every scheduled command from its handler's code: each
+  one reaches `self._song` / `self.application()` directly or
+  through a helper, and read-only handlers (such as `inspect_rack`)
+  count - reading the LOM is still a LOM access. No scheduled
+  command was provably free of the object model, so MCP-10 moved
+  none of them; the classes rest on the audit, not on a hope.
+- **handler** (15 commands): the command executes on the calling
+  (socket) thread. Three of them - `get_script_info`,
+  `drain_passive_events`, `refresh_browser_cache` - are proven to
+  touch only script-owned state and constants. The rest read the
+  LOM on the calling thread, the upstream dispatcher's long-standing
+  shape, preserved exactly; their off-thread safety is not proven
+  and is not claimed. `get_browser_categories` / `get_browser_items`
+  name handlers that do not exist and error immediately, as before.
+
+`execute_batch` is always one main-thread task, even when every
+item in it is handler class - batches are never split by item class.
+Benchmark section B7 measures the script-side cost of one
+scheduling hop under a fake scheduler; Live's own main-thread
+servicing wait is not measurable headlessly and no figure is
+claimed for it.
+
+MCP-10 also hardened the browser LRU caches (MCP-07): a concurrent
+clear or eviction landing between a cache lookup and its LRU touch
+could raise `KeyError` out of the lookup; the touch is now
+best-effort and the hit stands, with cache bounds, ordering and
+invalidation unchanged.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)

@@ -430,7 +430,7 @@ def test_bulk_set_timing_opt_in(script_module):
 
 def test_new_command_advertised_at_bumped_version(script_module):
     assert "set_device_parameters" in script_module.SCRIPT_CAPABILITIES
-    assert script_module.SCRIPT_VERSION == "1.7.8"
+    assert script_module.SCRIPT_VERSION == "1.7.9"
     info = script_module.AbletonMCP._get_script_info(
         make_instance(script_module))
     assert "set_device_parameters" in info["capabilities"]
