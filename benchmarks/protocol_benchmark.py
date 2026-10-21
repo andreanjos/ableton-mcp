@@ -655,6 +655,221 @@ def synthetic_snapshot(track_count, include_notes, include_params):
             "scenes": [], "cue_points": []}
 
 
+# -- B4: browser browse-then-find (MCP-07) ---------------------------------
+
+class _WalkCounter(object):
+    """Counts hierarchy walks: every .children access on a fake
+    browser item is one descent step a read pays inside Live."""
+
+    def __init__(self):
+        self.walks = 0
+
+
+class _BenchBrowserItem(object):
+    def __init__(self, counter, name, children=(), loadable=False,
+                 device=False, uri=None):
+        self._counter = counter
+        self.name = name
+        self._children = list(children)
+        self.is_folder = bool(children)
+        self.is_loadable = loadable
+        self.is_device = device
+        self.uri = uri
+
+    @property
+    def children(self):
+        self._counter.walks += 1
+        return self._children
+
+
+class _BenchBrowser(object):
+    """Plain-attribute browser: dir() sees only the five roots."""
+
+    def __init__(self, instruments, sounds, drums, audio_effects,
+                 midi_effects):
+        self.instruments = instruments
+        self.sounds = sounds
+        self.drums = drums
+        self.audio_effects = audio_effects
+        self.midi_effects = midi_effects
+
+
+def _bench_browser(counter):
+    def item(name, **kw):
+        return _BenchBrowserItem(counter, name, **kw)
+
+    def folder(name, children):
+        return _BenchBrowserItem(counter, name, children=children,
+                                 uri="bench:" + name.lower())
+
+    synths = folder("Synths", [
+        item("Analog", loadable=True, device=True, uri="bench:analog"),
+        item("Operator", loadable=True, device=True, uri="bench:operator"),
+        item("Wavetable", loadable=True, device=True, uri="bench:wavetable"),
+    ])
+    keys = folder("Keys", [
+        item("Grand Piano", loadable=True, uri="bench:grand-piano"),
+        item("Electric Piano", loadable=True, uri="bench:electric-piano"),
+    ])
+    instruments = _BenchBrowserItem(
+        counter, "Instruments",
+        children=[synths, keys,
+                  item("Simpler", loadable=True, device=True,
+                       uri="bench:simpler")],
+        uri="bench:instruments")
+    kits = folder("Kits", [
+        item("Kit %02d" % n, loadable=True, uri="bench:kit-%02d" % n)
+        for n in range(1, 25)])
+    drums = _BenchBrowserItem(counter, "Drums", children=[kits],
+                              uri="bench:drums")
+    sounds = _BenchBrowserItem(counter, "Sounds", children=[],
+                               uri="bench:sounds")
+    reverbs = folder("Reverbs", [
+        item("Hall Reverb", loadable=True, device=True, uri="bench:hall"),
+        item("Plate Reverb", loadable=True, device=True, uri="bench:plate"),
+    ])
+    audio_effects = _BenchBrowserItem(counter, "Audio Effects",
+                                      children=[reverbs],
+                                      uri="bench:audio-effects")
+    midi_effects = _BenchBrowserItem(counter, "MIDI Effects", children=[],
+                                     uri="bench:midi-effects")
+    return _BenchBrowser(instruments, sounds, drums, audio_effects,
+                         midi_effects)
+
+
+class BrowserPeer(object):
+    """The real Remote Script behind a real TCP socket, serving a
+    counting fake browser as its application."""
+
+    def __init__(self, script_module):
+        self.module = script_module
+        self.counter = _WalkCounter()
+        app = types.SimpleNamespace(browser=_bench_browser(self.counter))
+        inst = script_module.AbletonMCP.__new__(script_module.AbletonMCP)
+        inst.log_message = lambda *args: None
+        inst.running = True
+        inst.application = lambda: app
+        inst._clients_lock = threading.Lock()
+        inst._clients = set()
+        self.inst = inst
+        self.wire_requests = 0
+        process = inst._process_command
+        depth = [0]
+
+        def counting_process(request):
+            if depth[0] == 0:
+                self.wire_requests += 1
+            depth[0] += 1
+            try:
+                return process(request)
+            finally:
+                depth[0] -= 1
+
+        inst._process_command = counting_process
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self.port = self._listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        conn, _ = self._listener.accept()
+        try:
+            self.inst._handle_client(conn)
+        finally:
+            conn.close()
+
+    def connect(self):
+        from MCP_Server.server import AbletonConnection
+        return AbletonConnection("127.0.0.1", self.port)
+
+    def close(self):
+        self._listener.close()
+
+
+def bench_browser_browse():
+    """B4 (MCP-07): a browse-then-find session against the real script.
+
+    One peer runs a browse pass twice - cold caches, then warm, where
+    every repeated read must be served without a single hierarchy
+    walk. A second peer finds the items named "kit" the pre-MCP-07
+    way (tree + per-folder item reads, filtered client-side) and then
+    via search_browser. Hierarchy walks are .children accesses on the
+    fake browser: the repeated work the caches and the search exist
+    to remove.
+    """
+    mod = _load_remote_script_module()
+    rows = []
+
+    def browse_pass(conn):
+        conn.send_command("get_browser_tree", {"category_type": "all"})
+        for path in ("instruments", "instruments/Synths", "drums/Kits"):
+            conn.send_command("get_browser_items_at_path", {"path": path})
+        conn.send_command("get_browser_item", {"uri": "bench:kit-07"})
+
+    peer = BrowserPeer(mod)
+    try:
+        conn = peer.connect()
+        for label in ("browse pass, cold caches",
+                      "browse pass, warm caches (MCP-07)"):
+            reqs0, walks0 = peer.wire_requests, peer.counter.walks
+            started = time.perf_counter()
+            browse_pass(conn)
+            rows.append({
+                "workflow": label,
+                "wire_requests": peer.wire_requests - reqs0,
+                "hierarchy_walks": peer.counter.walks - walks0,
+                "wall_ms": (time.perf_counter() - started) * 1000.0,
+            })
+        conn.disconnect()
+    finally:
+        peer.close()
+
+    peer = BrowserPeer(mod)
+    try:
+        conn = peer.connect()
+        reqs0, walks0 = peer.wire_requests, peer.counter.walks
+        started = time.perf_counter()
+        conn.send_command("get_browser_tree", {"category_type": "all"})
+        found = 0
+        for path in ("instruments", "instruments/Synths",
+                     "instruments/Keys", "drums", "drums/Kits",
+                     "audio_effects", "audio_effects/Reverbs"):
+            result = conn.send_command("get_browser_items_at_path",
+                                       {"path": path})
+            found += sum(1 for it in result["items"]
+                         if "kit" in it["name"].lower())
+        rows.append({
+            "workflow": "find 'kit' client-side (tree + folder reads)",
+            "wire_requests": peer.wire_requests - reqs0,
+            "hierarchy_walks": peer.counter.walks - walks0,
+            "wall_ms": (time.perf_counter() - started) * 1000.0,
+        })
+
+        reqs0, walks0 = peer.wire_requests, peer.counter.walks
+        started = time.perf_counter()
+        offset = 0
+        found = 0
+        while offset is not None:
+            page = conn.send_command(
+                "search_browser",
+                {"query": "kit", "limit": 10, "offset": offset})
+            found += len(page["items"])
+            offset = page["next_offset"]
+        rows.append({
+            "workflow": "find 'kit' via search_browser (3 pages)",
+            "wire_requests": peer.wire_requests - reqs0,
+            "hierarchy_walks": peer.counter.walks - walks0,
+            "wall_ms": (time.perf_counter() - started) * 1000.0,
+        })
+        conn.disconnect()
+    finally:
+        peer.close()
+    return rows
+
+
 def bench_snapshot_model():
     rows = []
     for track_count in (8, 32, 128):
@@ -877,6 +1092,7 @@ def main(argv=None):
     results["round_trips"] = rows
     results["batch_round_trips"] = bench_batch_round_trips()
     results["bulk_tune"] = bench_bulk_tune()
+    results["browser_browse"] = bench_browser_browse()
     results["timing_captured"] = timing_captured
     results["snapshot_model"] = bench_snapshot_model()
     results["projected_snapshots"] = bench_projected_snapshots()
@@ -931,6 +1147,16 @@ def main(argv=None):
             r["connections"], r["wall_ms"]))
     print("  sets applied per row: %s" % ", ".join(
         str(r["sets_applied"]) for r in results["bulk_tune"]))
+    print()
+
+    print("B4. Browser browse-then-find against the real Remote "
+          "Script dispatcher (MCP-07):")
+    print("  %-42s %13s %16s %10s" % ("workflow", "wire requests",
+                                     "hierarchy walks", "wall ms"))
+    for r in results["browser_browse"]:
+        print("  %-42s %13d %16d %10.1f" % (
+            r["workflow"], r["wire_requests"], r["hierarchy_walks"],
+            r["wall_ms"]))
     print()
 
     print("C. Snapshot serialisation model (synthetic, audit 4.5 shape):")

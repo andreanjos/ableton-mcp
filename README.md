@@ -430,14 +430,83 @@ Measured with the benchmark below (real dispatcher, fake song): the
 8-parameter tune drops from 9 wire requests and 4,527 result bytes to
 2 wire requests and 2,936 result bytes.
 
+### Browser access diet
+
+Every browser read used to re-walk the hierarchy inside Live: the
+tree and items-at-path commands had no caching at all, and the one
+memo that existed - URI to item, used by every load - was an
+unbounded plain dict that was never invalidated, so it grew for the
+script's whole lifetime and could keep pointing at an item the
+library no longer had. Finding an item by name meant fetching whole
+subtrees and filtering them client-side. Both browser commands also
+logged the full `dir(browser)` attribute list on every call.
+
+The caches now live in the Remote Script, because that is where the
+walks happen: the MCP server only ever sees serialized results (it
+cannot hold item objects), and direct-wire clients skip the server
+entirely.
+
+- **URI memo** (`_uri_cache`): an LRU bounded at 512 entries.
+- **Read cache** (`_browser_read_cache`): an LRU bounded at 128
+  entries holding serialized results - `get_browser_tree` per
+  category, `get_browser_items_at_path` per (path, limit, offset),
+  and `search_browser` match lists per query. A repeated identical
+  read is served without touching the browser; failed reads are
+  never cached. `get_browser_item` by path is unchanged apart from
+  the memo (it navigates a single chain; it never walked the tree).
+
+Invalidation is explicit, because the script cannot observe library
+changes made outside it: a successful `load_browser_item` (or
+`load_instrument_or_effect`, which shares the path) clears both
+caches - loading is the one browser-directed mutation the script
+performs - and the new `refresh_browser_cache` command clears both
+on demand, returning how many entries each held
+(`{"cleared": {"uri_entries": n, "read_entries": m}}`). Call it after
+installing a pack, editing the user library, or rescanning.
+
+`search_browser` (command and tool) searches the browser in the
+script: `query` is a case-insensitive substring matched against each
+item's name and URI; the result is
+`{"query", "total", "offset", "limit", "next_offset", "items"}` with
+`limit` defaulting to 50 (cap 200), and each item carries its
+`path` in `get_browser_items_at_path` form (e.g.
+`instruments/Kits/808 Core Kit`). One walk computes the full match
+list, which is kept in the read cache, so paging and repeat searches
+cost no further walks. `get_browser_items_at_path` also pages now:
+pass `limit` and/or `offset` and only that slice of the children is
+serialized, with `total` and `next_offset` added to the result;
+with neither, the call and its params are exactly the pre-paging ones.
+
+The browser-path logging diet removes only the two per-call
+`dir(browser)` dumps; the attribute list itself is unchanged - it
+still feeds `available_categories` and root resolution in both
+commands.
+
+Measured by the benchmark's B4 scenario (real dispatcher over a real
+socket, counting fake browser, hierarchy walks = `children`
+accesses): a browse pass (tree + three items reads + one URI lookup)
+costs 5 wire requests and 127 hierarchy walks cold, and the same 5
+requests with **0 walks** warm. Finding the items named "kit"
+client-side (tree + seven folder reads, filtered locally) costs 8
+requests and 118 walks; `search_browser` answers it in 3 requests
+(three pages of 10) and 41 walks - the single walk that computes the
+match list.
+
+Requires Remote Script 1.7.7+ for the new commands. An older script
+ignores the paging parameters on `get_browser_items_at_path` and
+answers the two new commands with the standard
+`Unknown command: ...` error, which the tools surface as their
+usual Error strings.
+
 ### Benchmark
 
 `ableton-mcp-benchmark` (or `uv run python -m benchmarks.protocol_benchmark`)
 runs a headless protocol benchmark - no Live required: the repeated-parse
 framing cost on both endpoints against fake sockets, round-trip counts for
 representative composite workflows against a fake TCP peer, a synthetic
-snapshot serialisation model, and full vs projected snapshot sizes from
-the real serializer. Add `--json` for machine-readable output.
+snapshot serialisation model, full vs projected snapshot sizes from
+the real serializer, and a browser browse-then-find scenario counting
+wire requests and hierarchy walks. Add `--json` for machine-readable output.
 
 ## Limitations & Security Considerations
 

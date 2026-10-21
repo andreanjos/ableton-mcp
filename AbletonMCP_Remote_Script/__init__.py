@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 import struct
+from collections import OrderedDict
 
 # Change queue import for Python 2
 try:
@@ -35,7 +36,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.7.6"
+SCRIPT_VERSION = "1.7.7"
 PROTOCOL_VERSION = 1
 
 # Complete command surface of the _process_command dispatcher, kept sorted.
@@ -71,6 +72,8 @@ SCRIPT_CAPABILITIES = [
     "load_browser_item",
     "load_instrument_or_effect",
     "map_rack_magnitude",
+    "refresh_browser_cache",
+    "search_browser",
     "set_arrangement_clip_name",
     "set_clip_name",
     "set_current_song_time",
@@ -99,6 +102,20 @@ MAX_BATCH_COMMANDS = 1000
 # capped on the same rationale as MAX_BATCH_COMMANDS.
 MAX_BULK_PARAMETERS = 1000
 
+# MCP-07: browser cache bounds. The URI memo and the serialized
+# browser-read results live for the script instance's lifetime, so
+# both are LRU-bounded and explicitly invalidated (see
+# _invalidate_browser_caches) instead of growing forever.
+MAX_BROWSER_URI_CACHE_ENTRIES = 512
+MAX_BROWSER_READ_CACHE_ENTRIES = 128
+
+# MCP-07: paging bounds for the opt-in get_browser_items_at_path page
+# form and for search_browser.
+DEFAULT_BROWSER_ITEMS_PAGE_SIZE = 100
+MAX_BROWSER_ITEMS_PAGE_SIZE = 1000
+DEFAULT_BROWSER_SEARCH_PAGE_SIZE = 50
+MAX_BROWSER_SEARCH_PAGE_SIZE = 200
+
 # MCP-03 framing v2: a request (and its response) may travel as one
 # length-prefixed frame - 4-byte big-endian payload length + the UTF-8
 # JSON payload - instead of v1's raw single JSON object. The payload
@@ -114,6 +131,24 @@ MAX_BULK_PARAMETERS = 1000
 def _is_valid_request_id(value):
     """A request_id is an integer in [0, MAX_REQUEST_ID]; bools excluded."""
     return type(value) is int and 0 <= value <= MAX_REQUEST_ID
+
+
+def _coerce_page_int(value, default, maximum=None):
+    """Lenient page-parameter coercion (MCP-07), in the style of the
+    MCP-06 subset selectors: an unusable value falls back to the
+    default instead of failing the whole read; a usable one is
+    clamped to [0, maximum]."""
+    if value is None:
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    if number < 0:
+        number = 0
+    if maximum is not None and number > maximum:
+        number = maximum
+    return number
 
 
 def _finish_agent0_timing(response, timing_state):
@@ -761,7 +796,23 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self.get_browser_tree(category_type)
             elif command_type == "get_browser_items_at_path":
                 path = params.get("path", "")
-                response["result"] = self.get_browser_items_at_path(path)
+                # MCP-07: paging is opt-in; forward only the values
+                # the caller sent, so an unpaged call is exactly the
+                # pre-paging one (and a script without the paged form
+                # simply never sees them).
+                page_kwargs = {}
+                for key in ("limit", "offset"):
+                    if key in params:
+                        page_kwargs[key] = params[key]
+                response["result"] = self.get_browser_items_at_path(
+                    path, **page_kwargs)
+            elif command_type == "search_browser":
+                # MCP-07: script-side name/URI search with paging;
+                # see _search_browser.
+                response["result"] = self._search_browser(params)
+            elif command_type == "refresh_browser_cache":
+                # MCP-07: explicit invalidation of the browser caches.
+                response["result"] = self._refresh_browser_cache()
             # Read-only arrangement command – no main-thread scheduling required
             elif command_type == "get_arrangement_clips":
                 track_index = params.get("track_index", 0)
@@ -1798,6 +1849,13 @@ class AbletonMCP(ControlSurface):
             
             # Load the item
             app.browser.load_item(item)
+
+            # MCP-07: loading is the one browser-directed mutation
+            # the script performs, and the browser caches are only
+            # sound while the library is unchanged from the script's
+            # point of view - drop them so the next read or lookup
+            # re-walks (the audit pins invalidation on load).
+            self._invalidate_browser_caches()
             
             result = {
                 "loaded": True,
@@ -1843,16 +1901,21 @@ class AbletonMCP(ControlSurface):
 
         Top-level lookups are memoised on ``self._uri_cache`` so repeated
         loads of the same URI don't re-walk the entire browser tree.
+        MCP-07: the memo is an LRU bounded at
+        MAX_BROWSER_URI_CACHE_ENTRIES and is invalidated with the rest
+        of the browser caches (see _invalidate_browser_caches); it used
+        to be a plain dict that grew for the script's lifetime and
+        could keep pointing at an item the library no longer has.
         """
         if current_depth == 0:
-            cache = getattr(self, '_uri_cache', None)
-            if cache is None:
-                self._uri_cache = cache = {}
-            if uri in cache:
-                return cache[uri]
+            uri_cache, _ = self._browser_cache_state()
+            cached = self._browser_cache_get(uri_cache, uri)
+            if cached is not None:
+                return cached
             result = self._walk_browser_for_uri(browser_or_item, uri, max_depth, 0)
             if result is not None:
-                cache[uri] = result
+                self._browser_cache_put(uri_cache, uri, result,
+                                        MAX_BROWSER_URI_CACHE_ENTRIES)
             return result
         return self._walk_browser_for_uri(browser_or_item, uri, max_depth, current_depth)
 
@@ -1902,6 +1965,192 @@ class AbletonMCP(ControlSurface):
             self.log_message("Error finding browser item by URI: {0}".format(str(e)))
             return None
     
+    # -- Browser caches and search (MCP-07) --------------------------------
+    #
+    # Two bounded LRU caches, both per script instance:
+    #
+    # * ``_uri_cache`` maps a browser URI to the live item object, so
+    #   repeated lookups/loads of one URI don't re-walk the hierarchy.
+    # * ``_browser_read_cache`` maps a serialized browser read - a
+    #   get_browser_tree result, a get_browser_items_at_path result, a
+    #   search_browser match list - to its value, so a repeated
+    #   identical read returns without touching the browser at all.
+    #
+    # The caches live script-side because the walks they avoid happen
+    # here, inside Live's process. The MCP server only ever sees
+    # serialized results (a server-side cache could not hold item
+    # objects at all), and Omnicorp's default direct-wire clients skip
+    # the MCP server entirely.
+    #
+    # Invalidation: a successful load_browser_item clears both caches
+    # (see _load_browser_item), and the refresh_browser_cache command
+    # clears both on demand - the path a client takes after changing
+    # the library from outside the script (installing a pack, editing
+    # the user library, rescanning). Nothing else the script does
+    # mutates browser content; reads that fail are never cached.
+
+    def _browser_cache_state(self):
+        """Return (uri_cache, read_cache), creating them on first use.
+
+        Instances are not guaranteed to have run __init__ before a
+        command arrives (the historical _uri_cache was created the
+        same lazy way), so cache access goes through here.
+        """
+        uri_cache = getattr(self, "_uri_cache", None)
+        if uri_cache is None:
+            self._uri_cache = uri_cache = OrderedDict()
+        read_cache = getattr(self, "_browser_read_cache", None)
+        if read_cache is None:
+            self._browser_read_cache = read_cache = OrderedDict()
+        return uri_cache, read_cache
+
+    @staticmethod
+    def _browser_cache_get(cache, key):
+        """LRU lookup: the value, or None (never a stored value)."""
+        try:
+            value = cache[key]
+        except KeyError:
+            return None
+        cache.move_to_end(key)
+        return value
+
+    @staticmethod
+    def _browser_cache_put(cache, key, value, max_entries):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
+
+    def _invalidate_browser_caches(self):
+        """Drop every cached browser read and URI resolution."""
+        uri_cache, read_cache = self._browser_cache_state()
+        uri_cache.clear()
+        read_cache.clear()
+
+    def _refresh_browser_cache(self):
+        """refresh_browser_cache command: clear both browser caches
+        and report how many entries each held."""
+        uri_cache, read_cache = self._browser_cache_state()
+        cleared = {"uri_entries": len(uri_cache),
+                   "read_entries": len(read_cache)}
+        uri_cache.clear()
+        read_cache.clear()
+        return {"cleared": cleared}
+
+    @staticmethod
+    def _browser_roots(browser):
+        """(attribute name, root item) pairs in walk order.
+
+        The five standard categories first, then any other public
+        attribute that looks like a browser item - the same set
+        get_browser_tree renders.
+        """
+        roots = []
+        for attr in ("instruments", "sounds", "drums", "audio_effects",
+                     "midi_effects"):
+            if hasattr(browser, attr):
+                try:
+                    roots.append((attr, getattr(browser, attr)))
+                except (AttributeError, RuntimeError):
+                    continue
+        seen = set(attr for attr, _item in roots)
+        for attr in dir(browser):
+            if attr.startswith("_") or attr in seen:
+                continue
+            try:
+                item = getattr(browser, attr)
+            except (AttributeError, RuntimeError):
+                continue
+            if hasattr(item, "children") or hasattr(item, "name"):
+                roots.append((attr, item))
+        return roots
+
+    def _search_browser(self, params):
+        """search_browser command: find browser items by name or URI.
+
+        Params: ``query`` (required; a case-insensitive substring
+        matched against each item's name and URI), ``limit`` (default
+        50, at most MAX_BROWSER_SEARCH_PAGE_SIZE) and ``offset``
+        (default 0). Searching used to mean fetching whole subtrees
+        and filtering client-side; here one walk answers every page.
+
+        The result mirrors the agent0_live_api paging shape:
+        {"query", "total", "offset", "limit", "next_offset", "items"},
+        each item {"name", "is_folder", "is_device", "is_loadable",
+        "uri", "path"} with ``path`` in the get_browser_items_at_path
+        form (e.g. "instruments/Kits/808 Core Kit"). The full match
+        list for a query is computed once and kept in the read cache,
+        so paging and repeat searches cost no further walks until the
+        cache is invalidated.
+        """
+        if not isinstance(params, dict):
+            raise ValueError("search_browser requires an object of params")
+        query = params.get("query")
+        if not isinstance(query, (bytes, str)) or not query.strip():
+            raise ValueError(
+                "search_browser requires a non-empty 'query' string")
+        limit = _coerce_page_int(params.get("limit"),
+                                 DEFAULT_BROWSER_SEARCH_PAGE_SIZE,
+                                 MAX_BROWSER_SEARCH_PAGE_SIZE)
+        offset = _coerce_page_int(params.get("offset"), 0)
+
+        _, read_cache = self._browser_cache_state()
+        cache_key = ("search", query.lower())
+        matches = self._browser_cache_get(read_cache, cache_key)
+        if matches is None:
+            matches = self._collect_browser_matches(query)
+            self._browser_cache_put(read_cache, cache_key,
+                                    matches, MAX_BROWSER_READ_CACHE_ENTRIES)
+        total = len(matches)
+        page = matches[offset:offset + limit]
+        next_offset = offset + len(page)
+        return {
+            "query": query,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset if next_offset < total else None,
+            "items": page,
+        }
+
+    def _collect_browser_matches(self, query):
+        """One full hierarchy walk collecting search matches in
+        browser order (roots in _browser_roots order, depth-first)."""
+        app = self.application()
+        if not app:
+            raise RuntimeError("Could not access Live application")
+        if not hasattr(app, "browser") or app.browser is None:
+            raise RuntimeError(
+                "Browser is not available in the Live application")
+        needle = query.lower()
+        matches = []
+
+        def visit(item, path, depth):
+            children = getattr(item, "children", None) or []
+            name = item.name if hasattr(item, "name") else "Unknown"
+            uri = item.uri if hasattr(item, "uri") else None
+            if needle in name.lower() or (uri and needle in uri.lower()):
+                matches.append({
+                    "name": name,
+                    "is_folder": bool(children),
+                    "is_device": (hasattr(item, "is_device")
+                                  and item.is_device),
+                    "is_loadable": (hasattr(item, "is_loadable")
+                                    and item.is_loadable),
+                    "uri": uri,
+                    "path": path,
+                })
+            if depth >= 64:
+                return
+            for child in children:
+                child_name = (child.name if hasattr(child, "name")
+                              else "Unknown")
+                visit(child, path + "/" + child_name, depth + 1)
+
+        for attr, root in self._browser_roots(app.browser):
+            visit(root, attr, 0)
+        return matches
+
     # Helper methods
 
     def _find_blend_parameter(self, device):
@@ -3089,11 +3338,22 @@ class AbletonMCP(ControlSurface):
             # Check if browser is available
             if not hasattr(app, 'browser') or app.browser is None:
                 raise RuntimeError("Browser is not available in the Live application")
-            
-            # Log available browser attributes to help diagnose issues
+
+            # MCP-07: a repeated identical tree read is served from
+            # the read cache without re-walking the browser; the cache
+            # is invalidated on load and on refresh_browser_cache.
+            _, read_cache = self._browser_cache_state()
+            cache_key = ("tree", category_type)
+            cached = self._browser_cache_get(read_cache, cache_key)
+            if cached is not None:
+                return cached
+
+            # The attribute list feeds the result's
+            # available_categories and the extra-category scan below.
+            # It used to also be logged on every call - a full dir()
+            # dump per read (MCP-07 logging diet).
             browser_attrs = [attr for attr in dir(app.browser) if not attr.startswith('_')]
-            self.log_message("Available browser attributes: {0}".format(browser_attrs))
-            
+
             result = {
                 "type": category_type,
                 "categories": [],
@@ -3209,6 +3469,8 @@ class AbletonMCP(ControlSurface):
 
             self.log_message("Browser tree generated for {0} with {1} root categories".format(
                 category_type, len(result['categories'])))
+            self._browser_cache_put(read_cache, cache_key, result,
+                                    MAX_BROWSER_READ_CACHE_ENTRIES)
             return result
             
         except Exception as e:
@@ -3216,7 +3478,7 @@ class AbletonMCP(ControlSurface):
             self.log_message(traceback.format_exc())
             raise
     
-    def get_browser_items_at_path(self, path):
+    def get_browser_items_at_path(self, path, limit=None, offset=None):
         """
         Get browser items at a specific path.
         
@@ -3226,7 +3488,11 @@ class AbletonMCP(ControlSurface):
                  or any other available browser category
                  
         Returns:
-            Dictionary with items at the specified path
+            Dictionary with items at the specified path. With the
+            opt-in limit/offset (MCP-07), only that slice of the
+            children is serialized and the result gains "total"
+            and "next_offset"; with neither, the result is exactly
+            the pre-paging one.
         """
         try:
             # Access the application's browser instance instead of creating a new one
@@ -3237,10 +3503,22 @@ class AbletonMCP(ControlSurface):
             # Check if browser is available
             if not hasattr(app, 'browser') or app.browser is None:
                 raise RuntimeError("Browser is not available in the Live application")
+
+            # MCP-07: a repeated identical read (same path and
+            # page) is served from the read cache without
+            # re-navigating the browser; the cache is invalidated
+            # on load and on refresh_browser_cache.
+            _, read_cache = self._browser_cache_state()
+            cache_key = ("items", path, limit, offset)
+            cached = self._browser_cache_get(read_cache, cache_key)
+            if cached is not None:
+                return cached
             
-            # Log available browser attributes to help diagnose issues
+            # The attribute list drives root resolution below
+            # (and the unknown-category result). It used to also
+            # be logged on every call - a full dir() dump per
+            # read (MCP-07 logging diet).
             browser_attrs = [attr for attr in dir(app.browser) if not attr.startswith('_')]
-            self.log_message("Available browser attributes: {0}".format(browser_attrs))
                 
             # Parse the path
             path_parts = path.split("/")
@@ -3311,18 +3589,34 @@ class AbletonMCP(ControlSurface):
                     }
             
             # Get items at the current path
-            items = []
+            children = []
             if hasattr(current_item, 'children'):
-                for child in current_item.children:
-                    item_info = {
-                        "name": child.name if hasattr(child, 'name') else "Unknown",
-                        "is_folder": hasattr(child, 'children') and bool(child.children),
-                        "is_device": hasattr(child, 'is_device') and child.is_device,
-                        "is_loadable": hasattr(child, 'is_loadable') and child.is_loadable,
-                        "uri": child.uri if hasattr(child, 'uri') else None
-                    }
-                    items.append(item_info)
-            
+                children = list(current_item.children)
+
+            # MCP-07: paging is opt-in - with no limit/offset every
+            # child is serialized, exactly as before; with either,
+            # only the requested slice is and the result reports the
+            # full count and where the next page starts.
+            if limit is None and offset is None:
+                page = children
+            else:
+                page_offset = _coerce_page_int(offset, 0)
+                page_limit = _coerce_page_int(
+                    limit, DEFAULT_BROWSER_ITEMS_PAGE_SIZE,
+                    MAX_BROWSER_ITEMS_PAGE_SIZE)
+                page = children[page_offset:page_offset + page_limit]
+
+            items = []
+            for child in page:
+                item_info = {
+                    "name": child.name if hasattr(child, 'name') else "Unknown",
+                    "is_folder": hasattr(child, 'children') and bool(child.children),
+                    "is_device": hasattr(child, 'is_device') and child.is_device,
+                    "is_loadable": hasattr(child, 'is_loadable') and child.is_loadable,
+                    "uri": child.uri if hasattr(child, 'uri') else None
+                }
+                items.append(item_info)
+
             result = {
                 "path": path,
                 "name": current_item.name if hasattr(current_item, 'name') else "Unknown",
@@ -3332,8 +3626,17 @@ class AbletonMCP(ControlSurface):
                 "is_loadable": hasattr(current_item, 'is_loadable') and current_item.is_loadable,
                 "items": items
             }
-            
+            if limit is not None or offset is not None:
+                next_offset = page_offset + len(page)
+                result["total"] = len(children)
+                result["next_offset"] = (
+                    next_offset if next_offset < len(children) else None)
+
             self.log_message("Retrieved {0} items at path: {1}".format(len(items), path))
+            # MCP-07: only successful reads are cached - the error
+            # results above return early and are never stored.
+            self._browser_cache_put(read_cache, cache_key, result,
+                                    MAX_BROWSER_READ_CACHE_ENTRIES)
             return result
             
         except Exception as e:

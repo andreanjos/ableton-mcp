@@ -538,7 +538,7 @@ class FakeConn(object):
     def send_command(self, command_type, params=None, **kwargs):
         calls.append([command_type, params])
         if command_type == "get_script_info":
-            return {"name": "AbletonMCP", "script_version": "1.7.6",
+            return {"name": "AbletonMCP", "script_version": "1.7.7",
                     "protocol_version": 1,
                     "capabilities": ["get_session_snapshot"]}
         return {"ok": True}
