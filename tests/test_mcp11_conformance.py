@@ -62,9 +62,9 @@ installed``, target left byte-identical - because MCP-10 replaced
 that literal list with the COMMAND_TABLE-derived set. Making the
 extension installable again is MCP-13's job (fork+extension bundle);
 this suite pins the safety property that matters until then - the
-fork installer never produces a half-patched script - via the
-layout and AST-capability pins above, and the lane record carries
-the finding.
+extension's installer, failing closed as above, never produces a
+half-patched script - via the layout and AST-capability pins
+above, and the lane record carries the finding.
 
 Regenerating the goldens (only ever as a deliberate, reviewed act -
 e.g. after an intentional catalog change): re-run the probes that
