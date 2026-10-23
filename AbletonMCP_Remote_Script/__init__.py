@@ -3810,7 +3810,25 @@ class AbletonMCP(ControlSurface):
             # re-navigating the browser; the cache is invalidated
             # on load and on refresh_browser_cache.
             _, read_cache = self._browser_cache_state()
-            cache_key = ("items", path, limit, offset)
+            # SI-75: coerce the paging values BEFORE building the
+            # cache key. Keying on the raw values crashed the lookup
+            # on unhashable shapes (limit=[1] -> "unhashable type:
+            # 'list'") before this handler's lenient coercion could see
+            # them, and keyed the same coerced page under different
+            # entries for different raw forms (5 vs "5"). The
+            # unpaged form (both absent) keeps its exact key and
+            # result shape, so it never shares an entry with a
+            # paged read.
+            if limit is None and offset is None:
+                page_limit = None
+                page_offset = None
+                cache_key = ("items", path, limit, offset)
+            else:
+                page_offset = _coerce_page_int(offset, 0)
+                page_limit = _coerce_page_int(
+                    limit, DEFAULT_BROWSER_ITEMS_PAGE_SIZE,
+                    MAX_BROWSER_ITEMS_PAGE_SIZE, minimum=1)
+                cache_key = ("items", path, page_limit, page_offset)
             cached = self._browser_cache_get(read_cache, cache_key)
             if cached is not None:
                 return cached
@@ -3901,10 +3919,6 @@ class AbletonMCP(ControlSurface):
             if limit is None and offset is None:
                 page = children
             else:
-                page_offset = _coerce_page_int(offset, 0)
-                page_limit = _coerce_page_int(
-                    limit, DEFAULT_BROWSER_ITEMS_PAGE_SIZE,
-                    MAX_BROWSER_ITEMS_PAGE_SIZE, minimum=1)
                 page = children[page_offset:page_offset + page_limit]
 
             items = []
