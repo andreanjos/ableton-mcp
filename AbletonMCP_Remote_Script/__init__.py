@@ -677,6 +677,10 @@ class AbletonMCP(ControlSurface):
         """Process a command from the client and return a response"""
         command_type = command.get("type", "")
         params = command.get("params", {})
+        if "type" in command and not isinstance(command_type, str):
+            return {"status": "error", "message": "Invalid command type: must be a string"}
+        if "params" in command and not isinstance(params, dict):
+            return {"status": "error", "message": "Invalid params: must be an object"}
 
         # MCP-01 native timing (opt-in per request). A command carrying a
         # "request_id" -- or "timing": true -- gets an agent0_timing block

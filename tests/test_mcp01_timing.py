@@ -211,6 +211,83 @@ def test_boundary_request_ids_accepted(script_module):
         assert response["request_id"] == good
 
 
+# --------------------------------------- dispatcher entry guards (SI-71)
+
+@pytest.mark.parametrize("bad_params", [[1, 2], None, "fast"])
+def test_non_object_params_refused_at_entry(script_module, bad_params):
+    """SI-71 (SI-70 F1): a non-object params must refuse by name at the
+    _process_command entry, in the Invalid request ID envelope shape
+    (status/message only, no result key), before any handler runs.
+    Previously set_tempo leaked the list-object get error (and its
+    NoneType/str twins) with a result key."""
+    inst = make_instance(script_module)
+    called = []
+    inst._set_tempo = lambda tempo: called.append(tempo) or {"tempo": tempo}
+    response = inst._process_command(
+        {"type": "set_tempo", "params": bad_params})
+    assert response == {"status": "error",
+                        "message": "Invalid params: must be an object"}
+    assert called == []
+
+
+@pytest.mark.parametrize("bad_type", [42, None])
+def test_non_string_type_refused_at_entry(script_module, bad_type):
+    """SI-71 (SI-70 F1): a non-string type must refuse by name at the
+    entry, in the same status/message-only shape. Previously it leaked
+    the str-concatenation TypeError (and its NoneType twin) with a
+    result key."""
+    inst = make_instance(script_module)
+    response = inst._process_command({"type": bad_type, "params": {}})
+    assert response == {"status": "error",
+                        "message": "Invalid command type: must be a string"}
+
+
+def test_entry_guard_controls_missing_and_unknown_type_unchanged(
+        script_module):
+    """Controls: missing type and unknown string type keep the current
+    byte-identical dispatched envelopes (result key included)."""
+    inst = make_instance(script_module)
+    assert inst._process_command({"params": {}}) == {
+        "status": "error", "result": {}, "message": "Unknown command: "}
+    assert inst._process_command(
+        {"type": "nope_cmd", "params": {}}) == {
+        "status": "error", "result": {},
+        "message": "Unknown command: nope_cmd"}
+
+
+def test_entry_guard_missing_params_defaults_to_empty_object(
+        script_module):
+    """Control: a command with no params key still defaults to {}
+    and dispatches exactly as before."""
+    inst = make_instance(script_module)
+    inst._get_session_info = lambda: {"tempo": 120.0}
+    response = inst._process_command({"type": "get_session_info"})
+    assert response == {"status": "success", "result": {"tempo": 120.0}}
+
+
+def test_batch_item_non_string_type_covered_by_entry_guard(script_module):
+    """SI-71 batch ruling: execute_batch items route through
+    _process_command (via _execute_batch_item, which has no type check
+    of its own), so the entry guard covers a non-string item type.
+    The per-item envelope is the entry refusal verbatim."""
+    inst = make_instance(script_module)
+    inst._get_session_info = lambda: {"tempo": 120.0}
+    response = inst._process_command({
+        "type": "execute_batch",
+        "params": {"commands": [
+            {"type": 42, "params": {}},
+            {"type": "get_session_info"},
+        ]}})
+    assert response["status"] == "success"
+    results = response["result"]["results"]
+    assert results[0] == {
+        "status": "error",
+        "message": "Invalid command type: must be a string"}
+    assert results[1] == {"status": "success", "result": {"tempo": 120.0}}
+    assert response["result"]["summary"] == {
+        "total": 2, "succeeded": 1, "failed": 1, "skipped": 0}
+
+
 # --------------------------------------- installer (host_patch) anchors
 
 def test_host_patch_anchor_strings_preserved():
