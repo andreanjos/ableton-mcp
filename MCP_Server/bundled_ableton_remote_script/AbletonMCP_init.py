@@ -479,6 +479,10 @@ class AbletonMCP(ControlSurface):
         # client was still reading a real response from — desynchronising the
         # connection for good.
         buffer = bytearray()  # Received, not yet attributed to a message
+        sniff_offset = 0  # Buffer bytes the framing sniff already scanned:
+        # the leading whitespace is proven, and the first non-whitespace
+        # byte (once one is seen) sits at this index. Rescanning from
+        # byte 0 on every recv() made a padded request quadratic (SI-72).
         decoder = _FrameDecoder()  # Holds at most one partial v2 frame
         framing = None  # Framing of the message currently being answered
 
@@ -531,12 +535,42 @@ class AbletonMCP(ControlSurface):
                             continue
                         if not buffer:
                             break  # Nothing attributed: receive more
-                        framing = self._sniff_framing(buffer)
+                        framing = self._sniff_framing(buffer, sniff_offset)
                         if framing is None:
+                            if len(buffer) > MAX_REQUEST_BYTES:
+                                # The ceiling applies to the unattributed
+                                # buffer even when no framing can be decided
+                                # yet: an all-whitespace buffer is a v1
+                                # request in progress (v1 tolerates leading
+                                # whitespace), so refuse it exactly like the
+                                # brace-led oversize below - same error,
+                                # written in v1, then close.
+                                framing = "v1"
+                                sniff_offset = 0
+                                del buffer[:]
+                                raise ValueError(
+                                    "Request exceeded %d bytes without a complete JSON command"
+                                    % MAX_REQUEST_BYTES)
+                            # The scan above reached the end of the buffer,
+                            # except for a partial frame length prefix: its
+                            # first byte (0x00/0x01 at sniff_offset) must be
+                            # examined again once the rest of it arrives.
+                            if not (sniff_offset < len(buffer)
+                                    and buffer[sniff_offset] in (0, 1)):
+                                sniff_offset = len(buffer)
                             break  # Partial prefix: receive more
+                        # The sniff decided from sniff_offset on; move it
+                        # onto the first non-whitespace byte so a later
+                        # sniff of this same buffer (an incomplete v1
+                        # command) starts there instead of rescanning the
+                        # leading whitespace again.
+                        while (sniff_offset < len(buffer)
+                               and buffer[sniff_offset] in (32, 9, 13, 10)):
+                            sniff_offset += 1
                         if framing == "v2":
                             decoder.feed(bytes(buffer))
                             del buffer[:]
+                            sniff_offset = 0
                             continue
                         # Framing v1: the historical receive path,
                         # unchanged - the whole buffer must be the one
@@ -556,6 +590,7 @@ class AbletonMCP(ControlSurface):
                         except (ValueError, UnicodeDecodeError):
                             break
                         del buffer[:]  # Consume the parsed command
+                        sniff_offset = 0
                         dispatch(command)
 
                 except Exception as e:
@@ -589,7 +624,7 @@ class AbletonMCP(ControlSurface):
             self.log_message("Client handler stopped")
 
     @staticmethod
-    def _sniff_framing(buffer):
+    def _sniff_framing(buffer, start=0):
         """Decide the framing of the next message from its first bytes.
 
         Returns "v1", "v2", or None when more bytes are needed; raises
@@ -604,11 +639,15 @@ class AbletonMCP(ControlSurface):
         unambiguous from the first byte on. The decoded length
         itself is the decoder's to validate: handing an out-of-range
         prefix to it produces the precise framed error ("Invalid frame
-        length ...") instead of a silent close here.
+        length ...") instead of a silent close here. *start* is
+        the offset a previous scan of the same buffer reached;
+        scanning resumes there.
         """
-        index = 0
-        while index < len(buffer) and buffer[index:index + 1] in (
-                b" ", b"\t", b"\r", b"\n"):
+        # Byte values are space, tab, CR, LF: exactly the whitespace
+        # v1's json parsing tolerates as leading padding. Comparing
+        # the byte value avoids allocating a slice per byte.
+        index = start
+        while index < len(buffer) and buffer[index] in (32, 9, 13, 10):
             index += 1
         if index == len(buffer):
             return None  # Only whitespace so far

@@ -667,3 +667,88 @@ def test_end_to_end_negotiation_and_batch_over_v2(script_module):
         assert conn.last_timing is not None
     finally:
         peer.close()
+
+
+# ------------------------------------------------- SI-72 ceiling
+
+def _read_until_close(sock):
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return data
+        data += chunk
+
+
+def _read_one_v1_reply(sock):
+    data = b""
+    while True:
+        chunk = sock.recv(65536)
+        assert chunk, "connection closed before a reply arrived"
+        data += chunk
+        try:
+            return json.loads(data.decode("utf-8"))
+        except ValueError:
+            continue
+
+
+def _real_client(port):
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.settimeout(5)
+    return sock
+
+
+def test_v1_whitespace_flood_past_ceiling_refused_like_brace_led_control(
+        script_module, monkeypatch):
+    """SI-72: an all-whitespace buffer past the ceiling draws the same
+    refusal as the brace-led oversize - same error bytes, then close -
+    instead of growing unbounded while the sniff stays undecided."""
+    monkeypatch.setattr(script_module, "MAX_REQUEST_BYTES", 1024)
+    peer = ScriptPeer(script_module)
+    try:
+        expected = json.dumps({
+            "status": "error",
+            "message": ("Request exceeded 1024 bytes without a "
+                        "complete JSON command")}).encode("utf-8")
+        control = _real_client(peer.port)
+        try:
+            control.sendall(b"{" + b"x" * 3071)
+            control_reply = _read_until_close(control)
+        finally:
+            control.close()
+        flood = _real_client(peer.port)
+        try:
+            flood.sendall(b" " * 3072)
+            flood_reply = _read_until_close(flood)
+        finally:
+            flood.close()
+        assert control_reply == expected
+        assert flood_reply == expected
+        assert peer.requests == 0
+    finally:
+        peer.close()
+
+
+def test_v1_moderately_padded_request_still_succeeds_over_real_socket(
+        script_module):
+    """SI-72: a valid command behind a moderate whitespace pad (well
+    under the real ceiling), delivered in pieces, is answered as
+    before - the scanned-offset sniff changes no padded behaviour."""
+    peer = ScriptPeer(script_module)
+    try:
+        conn = _real_client(peer.port)
+        try:
+            pad = b" " * 4096
+            for i in range(0, len(pad), 1024):
+                conn.sendall(pad[i:i + 1024])
+            payload = json.dumps(
+                {"type": "get_session_info", "params": {}}).encode("utf-8")
+            conn.sendall(payload[:10])
+            conn.sendall(payload[10:])
+            reply = _read_one_v1_reply(conn)
+        finally:
+            conn.close()
+        assert reply == {"status": "success", "result": {"tempo": 120.0}}
+        assert peer.requests == 1
+    finally:
+        peer.close()
