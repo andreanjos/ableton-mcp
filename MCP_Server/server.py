@@ -503,6 +503,43 @@ class AbletonConnection:
 
             # Parse the response
             response = json.loads(response_data.decode('utf-8'))
+
+            # Envelope validation (SI-73, MCP-09): the request has
+            # been fully sent, so a reply that is not a script
+            # envelope is the same epistemic state as an unparseable
+            # reply - nothing definitive is known and the command
+            # may have been applied - and classifies as
+            # OutcomeUnknownError, not a plain failure a caller
+            # could read as safe to retry. The real script always
+            # sends {"status": "success", "result": ...} or
+            # {"status": "error", "message": ...} (its success
+            # envelope always carries a result key), so validation
+            # is all-or-nothing: a non-object reply, a missing or
+            # unrecognised status, and a success envelope with no
+            # result are all non-envelopes. Definitive envelopes
+            # below (error, request-id mismatch) stay plain.
+            if not isinstance(response, dict):
+                raise OutcomeUnknownError(
+                    "Invalid response from Ableton to %r: response "
+                    "is not a script envelope (expected a JSON "
+                    "object, got %s); %s"
+                    % (command_type, type(response).__name__,
+                       _unknown_tail),
+                    command_type=command_type)
+            if response.get("status") not in ("success", "error"):
+                raise OutcomeUnknownError(
+                    "Invalid response from Ableton to %r: envelope "
+                    "status is missing or unrecognised (%r); %s"
+                    % (command_type, response.get("status"),
+                       _unknown_tail),
+                    command_type=command_type)
+            if (response.get("status") == "success"
+                    and "result" not in response):
+                raise OutcomeUnknownError(
+                    "Invalid response from Ableton to %r: success "
+                    "envelope carries no 'result'; %s"
+                    % (command_type, _unknown_tail),
+                    command_type=command_type)
             logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
 
             if response.get("status") == "error":
@@ -524,7 +561,7 @@ class AbletonConnection:
                 # decides the framing of the NEXT exchange.
                 self._note_script_info(response.get("result"))
 
-            return response.get("result", {})
+            return response["result"]
         except OutcomeUnknownError:
             # Raised by the receive phase above (and the JSONDecodeError
             # handler below): the connection is dropped, the type and
