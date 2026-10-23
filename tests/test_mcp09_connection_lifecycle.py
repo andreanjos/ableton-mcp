@@ -424,3 +424,228 @@ def test_real_socket_delay_beyond_budget_is_outcome_unknown():
     # Gave up on the budget, not on the peer's 1 s delay.
     assert time.perf_counter() - started < 1.0
     assert conn.sock is None
+
+
+# ------------------------------------------- SI-73 envelope validation
+#
+# SI-70 F3: a complete, valid-JSON but non-envelope response was
+# accepted or crashed outside the MCP-09 classification. A non-object
+# reply raised a plain "Communication error ... 'list' object has no
+# attribute 'get'" (readable as definitive/safe-to-retry); a dict with
+# a missing or unrecognised status was returned as success; a success
+# envelope with no result silently returned {}. The pins below lock
+# the fixed classification: after the request was fully sent, a
+# non-envelope reply is OutcomeUnknownError (the command may have
+# been applied), the socket is dropped through the one teardown
+# path, and well-formed envelopes behave byte-identically to before.
+#
+# Decision (SI-73): {"status": "success"} with no "result" key is a
+# non-envelope and is outcome-unknown, NOT a silent {}. The real
+# script's success envelope always carries a result key (its
+# dispatcher initialises "result": {} and every success reply sets
+# it), so a missing key means the peer's answer is not a script
+# envelope; returning {} would fabricate a result the peer never
+# sent. A result key that is present - {} or null included - is a
+# well-formed success and is returned exactly as before (controls).
+
+def _assert_envelope_outcome_unknown(excinfo, sock, conn, command_type="get_session_info"):
+    assert excinfo.value.command_type == command_type
+    assert "Invalid response from Ableton" in str(excinfo.value)
+    assert "outcome unknown" in str(excinfo.value)
+    assert sock.closed is True
+    assert conn.sock is None
+
+
+def test_v1_non_object_list_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps([1, 2, 3]).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "not a script envelope" in str(excinfo.value)
+    assert "got list" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_non_object_number_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps(42).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "not a script envelope" in str(excinfo.value)
+    assert "got int" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_non_object_string_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps("text").encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "not a script envelope" in str(excinfo.value)
+    assert "got str" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_non_object_bool_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps(True).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "not a script envelope" in str(excinfo.value)
+    assert "got bool" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_null_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps(None).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "not a script envelope" in str(excinfo.value)
+    assert "got NoneType" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_missing_status_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps({"result": {"x": 1}}).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "status is missing or unrecognised (None)" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_unrecognised_status_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps(
+        {"status": "pending", "result": {"x": 2}}).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "status is missing or unrecognised ('pending')" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_empty_envelope_response_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps({}).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "status is missing or unrecognised (None)" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v1_success_without_result_is_outcome_unknown_and_closes():
+    sock = GapSock(json.dumps({"status": "success"}).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "success envelope carries no 'result'" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+
+
+def test_v2_non_object_response_is_outcome_unknown_and_closes():
+    sock = GapSock(encode_frame(json.dumps([1, 2, 3]).encode()))
+    conn = _conn(sock, framing_v2=True)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "not a script envelope" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+    assert conn._framing_v2 is False
+
+
+def test_v2_missing_status_response_is_outcome_unknown_and_closes():
+    sock = GapSock(encode_frame(json.dumps(
+        {"result": {"x": 1}, "request_id": 1}).encode()))
+    conn = _conn(sock, framing_v2=True)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "status is missing or unrecognised (None)" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+    assert conn._framing_v2 is False
+
+
+def test_v2_unrecognised_status_response_is_outcome_unknown_and_closes():
+    sock = GapSock(encode_frame(json.dumps(
+        {"status": "pending", "result": {"x": 2},
+         "request_id": 1}).encode()))
+    conn = _conn(sock, framing_v2=True)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "status is missing or unrecognised ('pending')" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+    assert conn._framing_v2 is False
+
+
+def test_v2_success_without_result_is_outcome_unknown_and_closes():
+    sock = GapSock(encode_frame(json.dumps(
+        {"status": "success", "request_id": 1}).encode()))
+    conn = _conn(sock, framing_v2=True)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "success envelope carries no 'result'" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(excinfo, sock, conn)
+    assert conn._framing_v2 is False
+
+
+def test_batch_non_envelope_response_is_outcome_unknown_at_batch_level():
+    sock = GapSock(json.dumps([1, 2, 3]).encode())
+    conn = _conn(sock)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_batch([{"type": "set_tempo", "params": {"tempo": 1}}])
+    assert "per-item outcomes are unknowable" in str(excinfo.value)
+    _assert_envelope_outcome_unknown(
+        excinfo, sock, conn, command_type="execute_batch")
+
+
+# SI-73 controls: well-formed envelopes are byte-identical to base.
+
+def test_control_success_with_empty_result_stays_success_and_open():
+    sock = GapSock(_v1_payload({}))
+    conn = _conn(sock)
+    assert conn.send_command("get_session_info") == {}
+    assert sock.closed is False
+    assert conn.sock is sock
+
+
+def test_control_success_with_null_result_stays_success_and_open():
+    payload = json.dumps({"status": "success", "result": None}).encode()
+    sock = GapSock(payload)
+    conn = _conn(sock)
+    assert conn.send_command("get_session_info") is None
+    assert sock.closed is False
+    assert conn.sock is sock
+
+
+def test_control_error_envelope_without_result_stays_plain():
+    # Pre-dispatch script errors carry no "result" key by design;
+    # that shape is a definitive envelope and must not be
+    # reclassified - unlike a success envelope without a result.
+    payload = json.dumps({"status": "error",
+                          "message": "Unknown command: nope"}).encode()
+    sock = GapSock(payload)
+    conn = _conn(sock)
+    with pytest.raises(Exception) as excinfo:
+        conn.send_command("nope")
+    assert type(excinfo.value) is Exception
+    assert not isinstance(excinfo.value, OutcomeUnknownError)
+    assert str(excinfo.value) == (
+        "Communication error with Ableton: Unknown command: nope")
+    assert sock.closed is True
+    assert conn.sock is None
+
+
+def test_control_request_id_mismatch_on_well_formed_envelope_stays_plain():
+    payload = json.dumps({"status": "success", "result": {},
+                          "request_id": 999}).encode()
+    sock = GapSock(payload)
+    conn = _conn(sock)
+    with pytest.raises(Exception) as excinfo:
+        conn.send_command("get_session_info", request_id=7)
+    assert type(excinfo.value) is Exception
+    assert not isinstance(excinfo.value, OutcomeUnknownError)
+    assert str(excinfo.value) == (
+        "Communication error with Ableton: Remote Script did not "
+        "echo request_id 7 (response carried 999); the loaded script "
+        "may not support request IDs")
+    assert sock.closed is True
+    assert conn.sock is None
