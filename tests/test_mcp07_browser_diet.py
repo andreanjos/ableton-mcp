@@ -18,6 +18,11 @@ property counts every hierarchy descent:
   next_offset bookkeeping;
 * a degenerate limit (0 or negative) on either paged read is
   clamped to a page size of 1, so next_offset always advances;
+* get_browser_items_at_path builds its read-cache key from the
+  coerced paging values (SI-75): an unhashable raw value reaches
+  the lenient coercion instead of crashing the cache lookup, and
+  raw forms of the same coerced page (5 / "5" / 5 with offset 0)
+  share one cache entry, while the unpaged form keeps its own;
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -402,6 +407,100 @@ def test_items_paging_degenerate_limit_advances():
         pages += 1
     assert pages == 10
     assert stitched == unpaged["items"]
+
+
+# ── Cache-key coercion on get_browser_items_at_path (SI-75) ─────────
+
+def test_items_paging_unhashable_values_are_coerced():
+    # At base the cache key was built from the raw values before
+    # coercion, so an unhashable limit/offset crashed the lookup
+    # with "unhashable type: 'list'" and the layer's lenient
+    # coercion never saw the value. Each shape below runs on a
+    # fresh instance (cold cache) and must return the same coerced
+    # default page as the "abc" control.
+    control_counter = WalkCounter()
+    control = wire(make_instance(build_browser(control_counter)),
+                   "get_browser_items_at_path",
+                   {"path": "instruments", "limit": "abc"})
+    assert control["total"] == 3 and control["next_offset"] is None
+    assert len(control["items"]) == 3
+    for params in ({"path": "instruments", "limit": [1]},
+                   {"path": "instruments", "limit": {"x": 1}},
+                   {"path": "instruments", "offset": [1]},
+                   {"path": "instruments", "offset": {"x": 1}}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        result = wire(inst, "get_browser_items_at_path", params)
+        assert canonical(result) == canonical(control)
+
+
+def test_items_paging_mixed_raw_forms_share_one_cache_entry():
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    forms = [
+        {"path": "drums/Kits", "limit": 2},
+        {"path": "drums/Kits", "limit": "2"},
+        {"path": "drums/Kits", "limit": 2, "offset": 0},
+        {"path": "drums/Kits", "limit": "2", "offset": "0"},
+        {"path": "drums/Kits", "limit": 2.9, "offset": 0},
+    ]
+    first = wire(inst, "get_browser_items_at_path", forms[0])
+    walks_after_first = counter.walks
+    assert walks_after_first > 0
+    for params in forms[1:]:
+        result = wire(inst, "get_browser_items_at_path", params)
+        assert canonical(result) == canonical(first)
+    # Every raw form above is the same coerced page (limit 2,
+    # offset 0): one cache entry, keyed by the coerced values,
+    # and no re-walk after the first read.
+    assert counter.walks == walks_after_first
+    _, read_cache = inst._browser_cache_state()
+    assert list(read_cache.keys()) == [("items", "drums/Kits", 2, 0)]
+
+
+def test_items_paging_default_forms_share_one_cache_entry():
+    # An unhashable value, a non-numeric string and the explicit
+    # default all coerce to the same page (limit 100, offset 0).
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    first = wire(inst, "get_browser_items_at_path",
+                 {"path": "instruments", "limit": [1]})
+    walks_after_first = counter.walks
+    for params in ({"path": "instruments", "limit": "abc"},
+                   {"path": "instruments", "limit": 100, "offset": 0},
+                   {"path": "instruments", "limit": 100}):
+        result = wire(inst, "get_browser_items_at_path", params)
+        assert canonical(result) == canonical(first)
+    assert counter.walks == walks_after_first
+    _, read_cache = inst._browser_cache_state()
+    assert list(read_cache.keys()) == [("items", "instruments", 100, 0)]
+
+
+def test_items_unpaged_form_keeps_its_own_cache_entry():
+    # Keeping the unpaged form exactly as today is load-bearing:
+    # its result has no total/next_offset, so it must never share
+    # an entry with the paged read that slices the same children.
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    unpaged = wire(inst, "get_browser_items_at_path",
+                   {"path": "instruments"})
+    assert "total" not in unpaged and "next_offset" not in unpaged
+    walks_after_unpaged = counter.walks
+    paged = wire(inst, "get_browser_items_at_path",
+                 {"path": "instruments", "limit": 100, "offset": 0})
+    assert paged["total"] == 3 and paged["items"] == unpaged["items"]
+    assert counter.walks > walks_after_unpaged
+    _, read_cache = inst._browser_cache_state()
+    assert set(read_cache.keys()) == {
+        ("items", "instruments", None, None),
+        ("items", "instruments", 100, 0)}
+    # The unpaged repeat still hits its own entry, walk-free,
+    # with the unpaged shape intact.
+    walks = counter.walks
+    again = wire(inst, "get_browser_items_at_path",
+                 {"path": "instruments"})
+    assert counter.walks == walks
+    assert canonical(again) == canonical(unpaged)
 
 
 # ── search_browser ───────────────────────────────────────────────────
