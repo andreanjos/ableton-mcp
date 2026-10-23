@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
-from .framing import FrameDecoder, encode_frame
+from .framing import FrameDecoder, FrameError, encode_frame
 
 
 def _env_flag(name: str) -> bool:
@@ -429,6 +429,27 @@ class AbletonConnection:
                     "request_id must be an integer in [0, 9007199254740991]")
             command["request_id"] = request_id
         
+        # SI-74: serialise and (under framing v2) frame the request
+        # BEFORE the exchange's try, beside the request_id validation
+        # above. encode_frame refuses a payload outside
+        # 2..MAX_FRAME_BYTES - a purely local property of this
+        # request: nothing has been sent, the peer is not involved,
+        # and the negotiated connection is healthy. Raised inside the
+        # try (the pre-SI-74 shape) that FrameError fell into the
+        # generic handler, which dropped the connection and reported
+        # the local refusal as a "Communication error with Ableton".
+        # Refuse here instead, as a ValueError naming the local
+        # refusal, so the connection survives for the next command.
+        # (A request json.dumps cannot serialise fails at the same
+        # line, likewise before any send and with the connection
+        # untouched.)
+        request_bytes = json.dumps(command).encode('utf-8')
+        if self._framing_v2:
+            try:
+                request_bytes = encode_frame(request_bytes)
+            except FrameError as e:
+                raise ValueError("Request not sent: %s" % (e,)) from e
+
         timeout = self._command_timeout(command_type, params)
         if command_type == "execute_batch":
             _unknown_tail = (
@@ -460,13 +481,12 @@ class AbletonConnection:
             # receive path then overrode it with a hard 15 s anyway.
             self.sock.settimeout(timeout)
 
-            # Send the command. Under framing v2 the same JSON bytes
-            # travel length-prefixed; the script answers in whichever
-            # framing the request used, so this choice is per-connection
-            # state, never a guess about the peer.
-            request_bytes = json.dumps(command).encode('utf-8')
-            if self._framing_v2:
-                request_bytes = encode_frame(request_bytes)
+            # Send the command (serialised and, under framing v2,
+            # framed before the try - SI-74). Under framing v2 the
+            # same JSON bytes travel length-prefixed; the script
+            # answers in whichever framing the request used, so this
+            # choice is per-connection state, never a guess about the
+            # peer.
             self.sock.sendall(request_bytes)
             logger.info(f"Command sent, waiting for response...")
             
