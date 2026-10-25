@@ -647,3 +647,159 @@ def test_tool_surface_and_wire_params():
         {"track_index": 1, "device_index": 2,
          "parameters": [{"name": "Cutoff", "value": 0.5}],
          "stop_on_error": True}]
+
+
+# ------------------------------------------------- SI-242 index guards
+# _set_device_parameter's copy-pasted range guards validated no
+# types (SI-239 F3): parameter_index=True WROTE parameter 1, NaN /
+# integral floats died at indexing with a raw interpreter message,
+# and string/list/None indices died at the comparison itself. The
+# bulk command inherits all of it per item, through the single set
+# (index-addressed items) and through _parameter_index_by_name
+# (name-addressed items). _require_index now refuses every non-int
+# by name ("Invalid <field>: must be an integer") at all three
+# guard sites; real ints keep the exact old behaviour, including
+# the existing out-of-range messages.
+
+_WRONG_TYPE_INDICES = [float("nan"), 1.0, "1", [1], None]
+
+
+def _single_set_response(inst, track_index=0, device_index=0,
+                         parameter_index=0, value=0.42):
+    return inst._process_command({
+        "type": "set_device_parameter",
+        "params": {"track_index": track_index,
+                   "device_index": device_index,
+                   "parameter_index": parameter_index, "value": value}})
+
+
+def _param_values(inst):
+    return [p.value for p in inst._song.tracks[0].devices[0].parameters]
+
+
+def test_single_set_bool_parameter_index_refused_and_writes_nothing(
+        script_module):
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    for bad in (True, False):
+        response = _single_set_response(inst, parameter_index=bad)
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "Invalid parameter_index: must be an integer")
+    assert _param_values(inst) == before
+
+
+def test_single_set_wrong_type_parameter_indices_refused_by_name(
+        script_module):
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    for bad in _WRONG_TYPE_INDICES:
+        response = _single_set_response(inst, parameter_index=bad)
+        assert response["status"] == "error", (bad, response)
+        assert response["message"] == (
+            "Invalid parameter_index: must be an integer")
+    assert _param_values(inst) == before
+
+
+def test_single_set_parameter_index_controls_unchanged(script_module):
+    inst = make_instance(script_module)
+    ok = _single_set_response(inst, parameter_index=2)
+    assert ok["status"] == "success", ok
+    assert ok["result"]["parameter_index"] == 2
+    assert _param_values(inst)[2] == 0.42
+    before = _param_values(inst)
+    for out_of_range in (99, -1):
+        response = _single_set_response(
+            inst, parameter_index=out_of_range)
+        assert response["status"] == "error", response
+        assert response["message"] == "Parameter index out of range"
+    assert _param_values(inst) == before
+
+
+def test_single_set_bool_track_and_device_indices_refused_by_name(
+        script_module):
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    by_track = _single_set_response(inst, track_index=True)
+    assert by_track["status"] == "error", by_track
+    assert by_track["message"] == (
+        "Invalid track_index: must be an integer")
+    by_device = _single_set_response(inst, device_index=True)
+    assert by_device["status"] == "error", by_device
+    assert by_device["message"] == (
+        "Invalid device_index: must be an integer")
+    assert _param_values(inst) == before
+
+
+def test_bulk_item_bool_parameter_index_refused_per_item(
+        script_module):
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    response = bulk_set_via_wire(
+        inst, [{"parameter_index": True, "value": 0.42}])
+    assert response["status"] == "success", response
+    item = response["result"]["results"][0]
+    # The item reached the single set, so its envelope is the direct
+    # call's: "result": {} included.
+    assert item["status"] == "error", item
+    assert item["result"] == {}
+    assert item["message"] == (
+        "Invalid parameter_index: must be an integer")
+    assert response["result"]["summary"]["failed"] == 1
+    assert _param_values(inst) == before
+
+
+def test_bulk_item_wrong_type_parameter_indices_refused_per_item(
+        script_module):
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    for bad in _WRONG_TYPE_INDICES[:-1]:
+        # (None is excluded on purpose: a None parameter_index is
+        # the pre-existing "address by name" signal in an item and
+        # never reaches the set; SI-242 does not change it.)
+        response = bulk_set_via_wire(
+            inst, [{"parameter_index": bad, "value": 0.42}])
+        item = response["result"]["results"][0]
+        assert item["status"] == "error", (bad, item)
+        assert item["message"] == (
+            "Invalid parameter_index: must be an integer")
+    assert _param_values(inst) == before
+
+
+def test_bulk_command_bool_track_index_refused_on_both_paths(
+        script_module):
+    # Index-addressed items reach the guard inside the single set;
+    # name-addressed items reach the twin guard inside
+    # _parameter_index_by_name. On a two-track song both paths
+    # silently wrote track 1 at base (the builder's probe, matching
+    # SI-239 D2); this suite's fake has one track, so the pin here
+    # asserts the by-name refusal and that nothing was written.
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    by_index = bulk_set_via_wire(
+        inst, [{"parameter_index": 0, "value": 0.42}], track_index=True)
+    item = by_index["result"]["results"][0]
+    assert item["status"] == "error", item
+    assert item["message"] == (
+        "Invalid track_index: must be an integer")
+    by_name = bulk_set_via_wire(
+        inst, [{"name": "Filter Cutoff", "value": 0.42}],
+        track_index=True)
+    item = by_name["result"]["results"][0]
+    assert item["status"] == "error", item
+    assert item["message"] == (
+        "Invalid track_index: must be an integer")
+    assert _param_values(inst) == before
+
+
+def test_bulk_parameter_index_controls_unchanged(script_module):
+    inst = make_instance(script_module)
+    ok = bulk_set_via_wire(inst, [{"parameter_index": 2, "value": 0.42}])
+    item = ok["result"]["results"][0]
+    assert item["status"] == "success", item
+    assert item["result"]["parameter_index"] == 2
+    assert _param_values(inst)[2] == 0.42
+    out = bulk_set_via_wire(inst, [{"parameter_index": 99, "value": 0.1}])
+    item = out["result"]["results"][0]
+    assert item["status"] == "error", item
+    assert item["message"] == "Parameter index out of range"
