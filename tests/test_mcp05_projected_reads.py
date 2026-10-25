@@ -685,3 +685,216 @@ def test_tool_surface_and_wire_params():
     assert obs["calls"][2] == ["get_track_info", {"track_index": 2}]
     assert obs["calls"][3] == [
         "get_track_info", {"track_index": 2, "include_devices": False}]
+
+
+# ------------------------------------------------- SI-242 index guards
+# The handler family's copy-pasted range guards validated no types
+# (SI-239 F3): a bool index silently selected element 0/1 (and was
+# echoed back as "index": true), NaN / integral floats passed both
+# range comparisons and died at indexing with a raw interpreter
+# message, and string/list/None indices died at the comparison
+# itself. _require_index now refuses every non-int by name
+# ("Invalid <field>: must be an integer"); real ints keep the exact
+# old behaviour, including the existing out-of-range messages.
+# The pins below cover the handler-thread read class
+# (get_track_info / get_clip_notes), one scheduled-group handler
+# (set_track_name), and the create-track adaptation site, whose
+# index is consumed by the LOM rather than a Python list and so is
+# validated for type only (no range check; -1 still means "end").
+
+_WRONG_TYPE_INDICES = [float("nan"), 1.0, "0", [0], None]
+
+
+def _track_info_response(inst, track_index):
+    return inst._process_command(
+        {"type": "get_track_info", "params": {"track_index": track_index}})
+
+
+def _clip_notes_response(inst, clip_index):
+    return inst._process_command(
+        {"type": "get_clip_notes",
+         "params": {"track_index": 0, "clip_index": clip_index}})
+
+
+def test_track_info_bool_track_index_refused_by_name(script_module):
+    # At base, True returned track 1's info with "index": true in the
+    # result and False returned track 0's; both are refused now.
+    inst = make_instance(script_module, multi_song())
+    for bad in (True, False):
+        response = _track_info_response(inst, bad)
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "Invalid track_index: must be an integer")
+
+
+def test_track_info_wrong_type_track_indices_refused_by_name(
+        script_module):
+    inst = make_instance(script_module, multi_song())
+    for bad in _WRONG_TYPE_INDICES:
+        response = _track_info_response(inst, bad)
+        assert response["status"] == "error", (bad, response)
+        assert response["message"] == (
+            "Invalid track_index: must be an integer")
+
+
+def test_track_info_index_controls_unchanged(script_module):
+    inst = make_instance(script_module, multi_song())
+    ok = _track_info_response(inst, 1)
+    assert ok["status"] == "success", ok
+    # The echoed index is the caller's real int, exactly as before.
+    assert ok["result"]["index"] == 1
+    assert type(ok["result"]["index"]) is int
+    assert ok["result"]["name"] == "Track 1"
+    for out_of_range in (99, -1):
+        response = _track_info_response(inst, out_of_range)
+        assert response["status"] == "error", response
+        assert response["message"] == "Track index out of range"
+
+
+def test_clip_notes_bool_clip_index_refused_by_name(script_module):
+    # At base, True addressed slot 1 (the empty slot: "No clip in
+    # slot") and False read slot 0 echoing "clip_index": false.
+    inst = make_instance(script_module, multi_song())
+    for bad in (True, False):
+        response = _clip_notes_response(inst, bad)
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "Invalid clip_index: must be an integer")
+
+
+def test_clip_notes_wrong_type_clip_indices_refused_by_name(
+        script_module):
+    inst = make_instance(script_module, multi_song())
+    for bad in _WRONG_TYPE_INDICES:
+        response = _clip_notes_response(inst, bad)
+        assert response["status"] == "error", (bad, response)
+        assert response["message"] == (
+            "Invalid clip_index: must be an integer")
+
+
+def test_clip_notes_index_controls_unchanged(script_module):
+    inst = make_instance(script_module, multi_song())
+    ok = _clip_notes_response(inst, 0)
+    assert ok["status"] == "success", ok
+    assert ok["result"]["clip_index"] == 0
+    assert ok["result"]["note_count"] == 1
+    # Slot 1 exists but is empty: the valid-int path is untouched.
+    empty = _clip_notes_response(inst, 1)
+    assert empty["status"] == "error", empty
+    assert empty["message"] == "No clip in slot"
+    for out_of_range in (99, -1):
+        response = _clip_notes_response(inst, out_of_range)
+        assert response["status"] == "error", response
+        assert response["message"] == "Clip index out of range"
+
+
+def _scheduled_instance(script_module, song):
+    """make_instance plus the inline scheduler the "main"-class
+    commands need (the pattern of the mcp01/mcp06 harnesses)."""
+    inst = make_instance(script_module, song)
+    inst.schedule_message = lambda delay, fn: fn()
+    return inst
+
+
+def _set_track_name_response(inst, track_index):
+    return inst._process_command(
+        {"type": "set_track_name",
+         "params": {"track_index": track_index, "name": "Renamed"}})
+
+
+def test_scheduled_set_track_name_bool_index_refused_by_name(
+        script_module):
+    # At base, track_index=True renamed track 1 and False track 0.
+    song = multi_song()
+    inst = _scheduled_instance(script_module, song)
+    for bad in (True, False):
+        response = _set_track_name_response(inst, bad)
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "Invalid track_index: must be an integer")
+    assert [t.name for t in song.tracks] == [
+        "Track 0", "Track 1", "Track 2"]
+
+
+def test_scheduled_set_track_name_wrong_type_indices_refused_by_name(
+        script_module):
+    song = multi_song()
+    inst = _scheduled_instance(script_module, song)
+    for bad in _WRONG_TYPE_INDICES:
+        response = _set_track_name_response(inst, bad)
+        assert response["status"] == "error", (bad, response)
+        assert response["message"] == (
+            "Invalid track_index: must be an integer")
+    assert [t.name for t in song.tracks] == [
+        "Track 0", "Track 1", "Track 2"]
+
+
+def test_scheduled_set_track_name_index_controls_unchanged(
+        script_module):
+    song = multi_song()
+    inst = _scheduled_instance(script_module, song)
+    ok = _set_track_name_response(inst, 1)
+    assert ok["status"] == "success", ok
+    assert [t.name for t in song.tracks] == [
+        "Track 0", "Renamed", "Track 2"]
+    for out_of_range in (99, -1):
+        response = _set_track_name_response(inst, out_of_range)
+        assert response["status"] == "error", response
+        assert response["message"] == "Track index out of range"
+
+
+class _CreatableSong(FakeSong):
+    """multi_song's song plus the LOM create calls, recorded."""
+
+    def __init__(self, tracks):
+        super().__init__(tracks)
+        self.created = []
+
+    def create_midi_track(self, index=-1):
+        self.created.append(("midi", index))
+        track = FakeTrack("NewMIDI")
+        if index == -1:
+            self.tracks.append(track)
+        else:
+            self.tracks.insert(index, track)
+
+    def create_audio_track(self, index=-1):
+        self.created.append(("audio", index))
+        track = FakeTrack("NewAudio")
+        if index == -1:
+            self.tracks.append(track)
+        else:
+            self.tracks.insert(index, track)
+
+
+def test_create_track_wrong_type_index_refused_before_lom(
+        script_module):
+    # The create index is consumed by Song.create_*_track (the LOM),
+    # not a Python list, so SI-242 validates its type only - but the
+    # refusal must land BEFORE the LOM call: at base the fake LOM had
+    # already recorded the call when the bad value died inside it.
+    song = _CreatableSong([FakeTrack("A"), FakeTrack("B")])
+    inst = _scheduled_instance(script_module, song)
+    for command in ("create_midi_track", "create_audio_track"):
+        for bad in [True, False] + _WRONG_TYPE_INDICES:
+            response = inst._process_command(
+                {"type": command, "params": {"index": bad}})
+            assert response["status"] == "error", (command, bad, response)
+            assert response["message"] == (
+                "Invalid index: must be an integer")
+    assert song.created == []
+    assert len(song.tracks) == 2
+
+
+def test_create_midi_track_valid_indices_unchanged(script_module):
+    song = _CreatableSong([FakeTrack("A"), FakeTrack("B")])
+    inst = _scheduled_instance(script_module, song)
+    at_end = inst._process_command(
+        {"type": "create_midi_track", "params": {"index": -1}})
+    assert at_end["status"] == "success", at_end
+    assert at_end["result"]["index"] == 2
+    at_zero = inst._process_command(
+        {"type": "create_midi_track", "params": {"index": 0}})
+    assert at_zero["status"] == "success", at_zero
+    assert at_zero["result"]["index"] == 0
+    assert song.created == [("midi", -1), ("midi", 0)]
