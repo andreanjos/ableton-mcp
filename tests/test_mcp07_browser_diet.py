@@ -37,7 +37,11 @@ property counts every hierarchy descent:
   dict crashed each lookup with a raw "unhashable type: ..."
   message; those shapes now refuse as "Invalid <field>: must
   be a string", write no cache entry, and hashable non-string
-  scalars (42, None) keep their exact legacy behaviour;
+  scalars (42, None) keep their exact legacy behaviour; the two
+  load commands share that same URI memo, so their list/dict
+  refusals are pinned directly as well, together with the
+  remaining probed hashable controls - a uri of bytes and a
+  category_type tuple (SI-238);
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -704,6 +708,124 @@ def test_browser_cache_key_hashable_scalars_are_unchanged():
     assert result["found"] is False and result["uri"] == 42
     result = wire(inst, "get_browser_item", {"uri": None})
     assert result["found"] is False and result["uri"] is None
+
+
+# ── SI-237 load routes + omitted scalar controls (SI-238) ─────────
+
+def test_load_browser_item_unhashable_uri_is_refused_by_name():
+    # load_browser_item reaches the URI memo through
+    # _load_browser_item -> _find_browser_item_by_uri, the same
+    # memo site SI-237 guarded for get_browser_item, so a list or
+    # dict item_uri crashed at base with the same raw
+    # "unhashable type: ..." envelope. Each shape runs on a fresh
+    # instance with a loadable browser (cold caches): the refusal
+    # is named, no cache entry is written, nothing is loaded or
+    # walked, and a valid load on the same instance still
+    # succeeds afterwards.
+    for bad in ([1], {"a": 1}):
+        counter = WalkCounter()
+        browser = build_browser(counter, LoadableBrowser)
+        inst = make_instance(browser)
+        response = inst._process_command(
+            {"type": "load_browser_item",
+             "params": {"item_uri": bad, "track_index": 0}})
+        assert response["status"] == "error", response
+        assert response["message"] == "Invalid uri: must be a string"
+        assert response["result"] == {}
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        assert browser.loaded == [] and counter.walks == 0
+        result = wire(inst, "load_browser_item",
+                      {"item_uri": "fake:808", "track_index": 0})
+        assert result["loaded"] is True
+        assert result["item_name"] == "808 Core Kit"
+        assert [item.name for item in browser.loaded] == ["808 Core Kit"]
+
+
+def test_load_instrument_or_effect_unhashable_uri_is_refused_by_name():
+    # load_instrument_or_effect delegates to _load_browser_item,
+    # so its uri param reaches the same memo site through the
+    # same path; it is pinned directly rather than resting on
+    # the delegation, for the same reason as load_browser_item
+    # above.
+    for bad in ([1], {"a": 1}):
+        counter = WalkCounter()
+        browser = build_browser(counter, LoadableBrowser)
+        inst = make_instance(browser)
+        response = inst._process_command(
+            {"type": "load_instrument_or_effect",
+             "params": {"uri": bad, "track_index": 0}})
+        assert response["status"] == "error", response
+        assert response["message"] == "Invalid uri: must be a string"
+        assert response["result"] == {}
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        assert browser.loaded == [] and counter.walks == 0
+        result = wire(inst, "load_instrument_or_effect",
+                      {"uri": "fake:808", "track_index": 0})
+        assert result["loaded"] is True
+        assert result["item_name"] == "808 Core Kit"
+        assert [item.name for item in browser.loaded] == ["808 Core Kit"]
+
+
+def test_browser_cache_key_uri_bytes_are_unchanged():
+    # The SI-237 refusal covers unhashable values only: a uri of
+    # bytes is hashable and keeps its exact base behaviour on
+    # every route that reaches the memo - get_browser_item
+    # resolves it to a plain not-found result (a miss is never
+    # cached), and both load routes fail downstream with the
+    # handler's own not-found message, loading nothing.
+    counter = WalkCounter()
+    browser = build_browser(counter, LoadableBrowser)
+    inst = make_instance(browser)
+    result = wire(inst, "get_browser_item", {"uri": b"fake:808"})
+    assert result == {"uri": b"fake:808", "path": None, "found": False}
+    uri_cache, read_cache = inst._browser_cache_state()
+    assert len(uri_cache) == 0 and len(read_cache) == 0
+
+    for command, params in (
+            ("load_browser_item",
+             {"item_uri": b"fake:808", "track_index": 0}),
+            ("load_instrument_or_effect",
+             {"uri": b"fake:808", "track_index": 0})):
+        counter = WalkCounter()
+        browser = build_browser(counter, LoadableBrowser)
+        inst = make_instance(browser)
+        response = inst._process_command(
+            {"type": command, "params": params})
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "Browser item with URI 'b'fake:808'' not found")
+        assert response["result"] == {}
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        assert browser.loaded == []
+
+
+def test_browser_cache_key_category_type_tuple_is_unchanged():
+    # A category_type tuple is hashable, so it passes the
+    # SI-237 guard untouched and keeps its exact base behaviour:
+    # a soft success with no categories, keyed in the read cache
+    # by the raw tuple, so a repeat read is served from that
+    # entry with no further walk and the identical result.
+    for value in ((1, 2), ("a", "b")):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        result = wire(inst, "get_browser_tree",
+                      {"category_type": value})
+        assert result["type"] == value and result["categories"] == []
+        assert result["available_categories"] == [
+            "audio_effects", "drums", "instruments", "midi_effects",
+            "sounds"]
+        assert result["total_folders"] == 0
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0
+        assert list(read_cache.keys()) == [("tree", value)]
+        walks_after_first = counter.walks
+        repeat = wire(inst, "get_browser_tree",
+                      {"category_type": value})
+        assert canonical(repeat) == canonical(result)
+        assert counter.walks == walks_after_first
 
 
 # ── search_browser ───────────────────────────────────────────────────
