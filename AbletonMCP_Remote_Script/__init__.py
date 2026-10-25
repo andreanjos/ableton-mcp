@@ -222,7 +222,9 @@ def _coerce_page_int(value, default, maximum=None, minimum=0):
         return default
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is int(inf) / int(-inf): a non-finite float
+        # is unusable like any other, so it falls back too (SI-236).
         return default
     if number < minimum:
         number = minimum

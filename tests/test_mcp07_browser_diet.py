@@ -23,6 +23,12 @@ property counts every hierarchy descent:
   the lenient coercion instead of crashing the cache lookup, and
   raw forms of the same coerced page (5 / "5" / 5 with offset 0)
   share one cache entry, while the unpaged form keeps its own;
+* paging values that are non-finite floats fall back to the
+  default page instead of failing the read (SI-236):
+  int(+-inf) raises OverflowError, which the lenient
+  coercion now treats as unusable alongside TypeError and
+  ValueError - NaN already fell back - while a finite
+  huge value still clamps to the cap;
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -501,6 +507,96 @@ def test_items_unpaged_form_keeps_its_own_cache_entry():
                  {"path": "instruments"})
     assert counter.walks == walks
     assert canonical(again) == canonical(unpaged)
+
+
+# ── Non-finite paging values fall back to the default (SI-236) ────
+
+def test_items_paging_nonfinite_values_fall_back_to_default():
+    # _coerce_page_int caught (TypeError, ValueError) around int(),
+    # but int(+-inf) raises OverflowError, so a non-finite limit or
+    # offset failed the whole read with "cannot convert float
+    # infinity to integer" instead of serving the documented
+    # default page. Each shape below runs on a fresh instance
+    # (cold cache) and must return exactly the coerced default
+    # page, as the "abc" control does; NaN already fell back at
+    # base (int(NaN) raises ValueError) and is pinned as a control.
+    control_counter = WalkCounter()
+    control = wire(make_instance(build_browser(control_counter)),
+                   "get_browser_items_at_path",
+                   {"path": "drums/Kits", "limit": "abc"})
+    assert control["total"] == 10 and control["next_offset"] is None
+    assert len(control["items"]) == 10
+    for params in ({"path": "drums/Kits", "limit": float("inf")},
+                   {"path": "drums/Kits", "limit": float("-inf")},
+                   {"path": "drums/Kits", "offset": float("inf")},
+                   {"path": "drums/Kits", "offset": float("-inf")},
+                   {"path": "drums/Kits", "limit": float("nan")},
+                   {"path": "drums/Kits", "offset": float("nan")}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        result = wire(inst, "get_browser_items_at_path", params)
+        assert canonical(result) == canonical(control)
+
+
+def test_items_paging_nonfinite_shares_the_default_cache_entry():
+    # The fallback is the coerced default page itself, not an
+    # error: an inf read keys the read cache by (100, 0) exactly
+    # like the explicit-default read, so the two share one entry,
+    # the repeat does not re-walk, and nothing is poisoned.
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    first = wire(inst, "get_browser_items_at_path",
+                 {"path": "instruments", "limit": float("inf")})
+    walks_after_first = counter.walks
+    assert walks_after_first > 0
+    result = wire(inst, "get_browser_items_at_path",
+                  {"path": "instruments", "limit": 100, "offset": 0})
+    assert canonical(result) == canonical(first)
+    assert counter.walks == walks_after_first
+    _, read_cache = inst._browser_cache_state()
+    assert list(read_cache.keys()) == [("items", "instruments", 100, 0)]
+
+
+def test_search_paging_nonfinite_values_fall_back_to_default():
+    # Same escape on the search_browser paging coercion: limit and
+    # offset alike. The result reports its effective paging, so the
+    # default (limit 50, offset 0) is asserted directly as well as
+    # by equality with the "abc" control page.
+    control_counter = WalkCounter()
+    control = wire(make_instance(build_browser(control_counter)),
+                   "search_browser", {"query": "kit", "limit": "abc"})
+    assert control["limit"] == 50 and control["offset"] == 0
+    assert control["total"] == 11 and len(control["items"]) == 11
+    for params in ({"query": "kit", "limit": float("inf")},
+                   {"query": "kit", "limit": float("-inf")},
+                   {"query": "kit", "offset": float("inf")},
+                   {"query": "kit", "offset": float("-inf")},
+                   {"query": "kit", "limit": float("nan")},
+                   {"query": "kit", "offset": float("nan")}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        result = wire(inst, "search_browser", params)
+        assert result["limit"] == 50 and result["offset"] == 0
+        assert canonical(result) == canonical(control)
+
+
+def test_paging_finite_huge_values_still_clamp_not_fall_back():
+    # The SI-236 fallback covers non-finite values only: a finite
+    # huge limit still clamps to the cap (it does not fall back to
+    # the default), and the "1e400" string form - unparseable as
+    # an int - still falls back, both unchanged from base.
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    page = wire(inst, "search_browser", {"query": "kit", "limit": 1e308})
+    assert page["limit"] == 200 and page["total"] == 11
+    assert len(page["items"]) == 11
+    page = wire(inst, "search_browser", {"query": "kit", "limit": "1e400"})
+    assert page["limit"] == 50 and page["total"] == 11
+    items = wire(inst, "get_browser_items_at_path",
+                 {"path": "drums/Kits", "limit": 1e308})
+    assert items["total"] == 10 and len(items["items"]) == 10
+    _, read_cache = inst._browser_cache_state()
+    assert ("items", "drums/Kits", 1000, 0) in read_cache
 
 
 # ── search_browser ───────────────────────────────────────────────────
