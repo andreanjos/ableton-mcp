@@ -230,6 +230,40 @@ def test_subset_empty_selection_returns_no_parameters(script_module):
     assert device_params_via_wire(inst, parameter_names=[]) == []
 
 
+def test_subset_parameter_indices_infinity_entries_are_skipped(script_module):
+    # SI-240: int(+-inf) raises OverflowError, which the selector's
+    # except (TypeError, ValueError) did not catch, so a +-Infinity
+    # entry failed the whole read with "cannot convert float
+    # infinity to integer" instead of being skipped like every
+    # other unusable entry (SI-239 F1, sibling of the SI-236 fix).
+    inst = make_instance(script_module)
+    assert device_params_via_wire(inst, parameter_indices=[float("inf")]) == []
+    assert device_params_via_wire(inst, parameter_indices=[float("-inf")]) == []
+    assert device_params_via_wire(
+        inst, parameter_indices=[float("inf"), float("-inf")]) == []
+
+
+def test_subset_parameter_indices_nan_entry_is_skipped_control(script_module):
+    # Control: int(NaN) raises ValueError, already caught at base,
+    # so a NaN entry was already skipped; this pin must pass both
+    # before and after the SI-240 fix.
+    inst = make_instance(script_module)
+    assert device_params_via_wire(inst, parameter_indices=[float("nan")]) == []
+
+
+def test_subset_parameter_indices_mixed_valid_and_infinity_returns_valid(script_module):
+    # One bad entry must not poison an otherwise valid list:
+    # the valid selection is still returned.
+    inst = make_instance(script_module)
+    full = device_params_via_wire(inst)
+    mixed = device_params_via_wire(
+        inst, parameter_indices=[1, float("inf")])
+    assert mixed == [e for e in full if e["index"] == 1]
+    mixed2 = device_params_via_wire(
+        inst, parameter_indices=[0, float("-inf"), 2])
+    assert mixed2 == [e for e in full if e["index"] in (0, 2)]
+
+
 def test_unsubsetted_read_is_the_pre_subset_read(script_module):
     inst = make_instance(script_module)
     via_wire = inst._process_command(

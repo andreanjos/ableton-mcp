@@ -3302,7 +3302,7 @@ class AbletonMCP(ControlSurface):
                 for entry in parameter_indices or ():
                     try:
                         wanted_indices.add(int(entry))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                 wanted_names = set(parameter_names or ())
                 info = self._filter_device_parameters(
@@ -3364,7 +3364,7 @@ class AbletonMCP(ControlSurface):
                 for entry in track_indices:
                     try:
                         wanted.add(int(entry))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError, OverflowError):
                         continue
                 selected = [i for i in range(len(self._song.tracks))
                             if i in wanted]

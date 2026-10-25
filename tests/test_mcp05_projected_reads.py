@@ -332,6 +332,42 @@ def test_track_indices_projection_is_a_slice_of_full(script_module):
     assert inst._get_session_snapshot(track_indices=[])["tracks"] == []
 
 
+def test_track_indices_infinity_entries_are_skipped(script_module):
+    # SI-240: int(+-inf) raises OverflowError, which the selector's
+    # except (TypeError, ValueError) did not catch, so a +-Infinity
+    # entry failed the whole snapshot read with "cannot convert
+    # float infinity to integer" instead of being skipped like
+    # every other unusable entry (SI-239 F1, sibling of SI-236).
+    inst = make_instance(script_module, multi_song())
+    assert inst._get_session_snapshot(
+        track_indices=[float("inf")])["tracks"] == []
+    assert inst._get_session_snapshot(
+        track_indices=[float("-inf")])["tracks"] == []
+    assert inst._get_session_snapshot(
+        track_indices=[float("inf"), float("-inf")])["tracks"] == []
+
+
+def test_track_indices_nan_entry_is_skipped_control(script_module):
+    # Control: int(NaN) raises ValueError, already caught at base,
+    # so a NaN entry was already skipped; this pin must pass both
+    # before and after the SI-240 fix.
+    inst = make_instance(script_module, multi_song())
+    assert inst._get_session_snapshot(
+        track_indices=[float("nan")])["tracks"] == []
+
+
+def test_track_indices_mixed_valid_and_infinity_returns_valid(script_module):
+    # One bad entry must not poison an otherwise valid list:
+    # the valid selection is still returned, in song order.
+    inst = make_instance(script_module, multi_song())
+    full = inst._get_session_snapshot()
+    mixed = inst._get_session_snapshot(track_indices=[1, float("inf")])
+    assert mixed["tracks"] == [full["tracks"][1]]
+    mixed2 = inst._get_session_snapshot(
+        track_indices=[0, float("-inf"), 2])
+    assert mixed2["tracks"] == [full["tracks"][0], full["tracks"][2]]
+
+
 def test_section_projection_omits_keys(script_module):
     inst = make_instance(script_module, multi_song())
     full = inst._get_session_snapshot()
