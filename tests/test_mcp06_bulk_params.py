@@ -264,6 +264,105 @@ def test_subset_parameter_indices_mixed_valid_and_infinity_returns_valid(script_
     assert mixed2 == [e for e in full if e["index"] in (0, 2)]
 
 
+def device_params_response(inst, **extra_params):
+    params = {"track_index": 0, "device_index": 0}
+    params.update(extra_params)
+    return inst._process_command(
+        {"type": "get_device_parameters", "params": params})
+
+
+def test_subset_parameter_indices_non_list_selector_refused_by_name(
+        script_module):
+    # SI-241: a non-list parameter_indices was silently misread - a
+    # string was iterated character-wise ("12" selected parameters 1
+    # and 2), a dict iterated its keys, a set iterated its members -
+    # or died raw ("'int' object is not iterable" for 123). A selector
+    # that is not a list/tuple can never be honoured as sent, so it
+    # refuses by name (SI-239 F2, SI-237 entry-refusal style).
+    inst = make_instance(script_module)
+    for bad in ("12", {"1": 9, "2": 9}, 123, 1.5, True, {1, 2}):
+        response = device_params_response(inst, parameter_indices=bad)
+        assert response["status"] == "error", bad
+        assert response["message"] == \
+            "Invalid parameter_indices: must be a list or tuple", bad
+
+
+def test_subset_parameter_indices_wrong_type_entries_are_skipped(
+        script_module):
+    # SI-241: entries that are not real ints never select - a float
+    # is no longer truncated ([1.9, 0.9] selected 1 and 0), True no
+    # longer selects index 1, False no longer selects index 0, and a
+    # digit string is no longer coerced (["1", "2"] selected 1 and
+    # 2). Wrong-type entries are skipped, preserving the established
+    # skip-unusable-entries contract ("x"/None/[[1]]/NaN/+-Inf are
+    # skipped, pinned above and by SI-240): one bad entry does not
+    # fail the whole read.
+    inst = make_instance(script_module)
+    assert device_params_via_wire(inst, parameter_indices=[1.9, 0.9]) == []
+    assert device_params_via_wire(inst, parameter_indices=[True]) == []
+    assert device_params_via_wire(inst, parameter_indices=[False]) == []
+    assert device_params_via_wire(inst, parameter_indices=["1", "2"]) == []
+    full = device_params_via_wire(inst)
+    mixed = device_params_via_wire(inst, parameter_indices=[1, 0.9])
+    assert mixed == [e for e in full if e["index"] == 1]
+    mixed2 = device_params_via_wire(inst, parameter_indices=[2, True])
+    assert mixed2 == [e for e in full if e["index"] == 2]
+    mixed3 = device_params_via_wire(inst, parameter_indices=[0, "2"])
+    assert mixed3 == [e for e in full if e["index"] == 0]
+
+
+def test_subset_parameter_indices_tuple_selector_still_works(script_module):
+    # Control: a tuple selector was valid before SI-241 and stays
+    # valid - only non-list/tuple containers change.
+    inst = make_instance(script_module)
+    full = device_params_via_wire(inst)
+    subset = device_params_via_wire(inst, parameter_indices=(1, 2))
+    assert subset == [e for e in full if e["index"] in (1, 2)]
+
+
+def test_subset_parameter_names_non_list_selector_refused_by_name(
+        script_module):
+    # SI-241: parameter_names="Filter Cutoff" (a string) silently
+    # returned a successful read with zero parameters, a dict
+    # iterated its keys and could actually select, and 123 died raw
+    # ("'int' object is not iterable"). Non-list/tuple selectors
+    # refuse by name.
+    inst = make_instance(script_module)
+    for bad in ("Filter Cutoff", 123, {"Filter Cutoff": 1},
+                {"Filter Cutoff"}, 1.5, True):
+        response = device_params_response(inst, parameter_names=bad)
+        assert response["status"] == "error", bad
+        assert response["message"] == \
+            "Invalid parameter_names: must be a list or tuple", bad
+
+
+def test_subset_parameter_names_non_string_entries_refused_by_name(
+        script_module):
+    # SI-241: an unhashable name entry crashed raw ("unhashable
+    # type: 'list'") and a hashable non-string silently matched
+    # nothing. Name entries must be strings; any other entry refuses
+    # by name, even alongside a valid name - the read already failed
+    # whole for the unhashable shapes at base, so a by-name refusal
+    # is not a new failure mode here.
+    inst = make_instance(script_module)
+    for bad in ([["Filter Cutoff"]], [{"a": 1}], [123], [None], [True],
+                [1.5], [("Filter Cutoff",)], [b"Filter Cutoff"],
+                ["Filter Cutoff", ["x"]], ["Filter Cutoff", 123]):
+        response = device_params_response(inst, parameter_names=bad)
+        assert response["status"] == "error", bad
+        assert response["message"] == \
+            "Invalid parameter_names: entries must be strings", bad
+
+
+def test_subset_parameter_names_tuple_selector_still_works(script_module):
+    # Control: a tuple of names was valid before SI-241 and stays
+    # valid - only non-list/tuple containers change.
+    inst = make_instance(script_module)
+    by_name = device_params_via_wire(
+        inst, parameter_names=("Filter Cutoff",))
+    assert [e["name"] for e in by_name] == ["Filter Cutoff"]
+
+
 def test_unsubsetted_read_is_the_pre_subset_read(script_module):
     inst = make_instance(script_module)
     via_wire = inst._process_command(

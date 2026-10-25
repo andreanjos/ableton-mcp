@@ -368,6 +368,55 @@ def test_track_indices_mixed_valid_and_infinity_returns_valid(script_module):
     assert mixed2["tracks"] == [full["tracks"][0], full["tracks"][2]]
 
 
+def test_track_indices_non_list_selector_refused_by_name(script_module):
+    # SI-241: a non-list track_indices was silently misread - a
+    # string was iterated character-wise ("01" selected tracks 0 and
+    # 1), a dict iterated its keys, a set iterated its members - or
+    # died raw ("'int' object is not iterable" for 123). A selector
+    # that is not a list/tuple refuses by name (SI-239 F2).
+    inst = make_instance(script_module, multi_song())
+    for bad in ("01", {"0": 1}, 123, 1.5, True, {0, 1}):
+        with pytest.raises(ValueError) as excinfo:
+            inst._get_session_snapshot(track_indices=bad)
+        assert str(excinfo.value) == \
+            "Invalid track_indices: must be a list or tuple", bad
+
+
+def test_track_indices_wrong_type_entries_are_skipped(script_module):
+    # SI-241: entries that are not real ints never select - floats
+    # are no longer truncated ([1.9, 0.9] / [0.9] selected tracks 1
+    # and 0 / track 0), True/False no longer select tracks 1/0, and
+    # digit strings are no longer coerced (["0", "1"] selected
+    # tracks 0 and 1). Wrong-type entries are skipped, preserving
+    # the established skip-unusable-entries contract ("x"/None/
+    # [[0]]/NaN/+-Inf are skipped, pinned above and by SI-240).
+    inst = make_instance(script_module, multi_song())
+    assert inst._get_session_snapshot(
+        track_indices=[1.9, 0.9])["tracks"] == []
+    assert inst._get_session_snapshot(
+        track_indices=[0.9])["tracks"] == []
+    assert inst._get_session_snapshot(
+        track_indices=[True])["tracks"] == []
+    assert inst._get_session_snapshot(
+        track_indices=[False])["tracks"] == []
+    assert inst._get_session_snapshot(
+        track_indices=["0", "1"])["tracks"] == []
+    full = inst._get_session_snapshot()
+    mixed = inst._get_session_snapshot(track_indices=[1, 0.9])
+    assert mixed["tracks"] == [full["tracks"][1]]
+    mixed2 = inst._get_session_snapshot(track_indices=[2, True])
+    assert mixed2["tracks"] == [full["tracks"][2]]
+
+
+def test_track_indices_tuple_selector_still_works(script_module):
+    # Control: a tuple selector was valid before SI-241 and stays
+    # valid - only non-list/tuple containers change.
+    inst = make_instance(script_module, multi_song())
+    full = inst._get_session_snapshot()
+    projected = inst._get_session_snapshot(track_indices=(0, 2))
+    assert projected["tracks"] == [full["tracks"][0], full["tracks"][2]]
+
+
 def test_section_projection_omits_keys(script_module):
     inst = make_instance(script_module, multi_song())
     full = inst._get_session_snapshot()
