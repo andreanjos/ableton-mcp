@@ -254,6 +254,23 @@ def _require_hashable_cache_key(value, field):
     return value
 
 
+def _require_list_selector(value, field):
+    """Refuse a subset/projection selector that is not a list/tuple.
+
+    MCP-05/MCP-06 selectors (SI-241): a string selector was iterated
+    character-wise ("12" selected indices 1 and 2), a dict selector
+    iterated its keys, and a non-iterable selector died with a raw
+    "'int' object is not iterable" - all silent or misleading. A
+    selector that is not a list/tuple can never be honoured as sent,
+    so it is refused by name here, in the SI-237 entry-refusal style.
+    Lists and tuples pass through untouched.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(
+            "Invalid {0}: must be a list or tuple".format(field))
+    return value
+
+
 def _finish_agent0_timing(response, timing_state):
     """Attach the agent0_timing block to a response envelope.
 
@@ -3299,12 +3316,38 @@ class AbletonMCP(ControlSurface):
             info = self._serialize_device(device, device_index, include_params=True)
             if parameter_indices is not None or parameter_names is not None:
                 wanted_indices = set()
-                for entry in parameter_indices or ():
-                    try:
-                        wanted_indices.add(int(entry))
-                    except (TypeError, ValueError, OverflowError):
-                        continue
-                wanted_names = set(parameter_names or ())
+                if parameter_indices is not None:
+                    for entry in _require_list_selector(
+                            parameter_indices, "parameter_indices"):
+                        # SI-241: only a real int selects (the type
+                        # check mirrors _is_valid_request_id, so bools
+                        # are excluded); every other entry is unusable
+                        # and skipped, exactly as "x"/None/[[1]] were
+                        # skipped before and as +-Inf/NaN are skipped
+                        # under the SI-240 catch retained below - a
+                        # float is never truncated into an index and
+                        # True never selects index 1.
+                        if type(entry) is not int:
+                            continue
+                        try:
+                            wanted_indices.add(int(entry))
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                wanted_names = set()
+                if parameter_names is not None:
+                    for entry in _require_list_selector(
+                            parameter_names, "parameter_names"):
+                        # SI-241: a name entry that is not a string
+                        # can never match a parameter name; refuse it
+                        # by name instead of the raw "unhashable type"
+                        # a list/dict entry raised from set(...)
+                        # before, or the silent no-match a hashable
+                        # non-string entry gave.
+                        if not isinstance(entry, str):
+                            raise ValueError(
+                                "Invalid parameter_names: "
+                                "entries must be strings")
+                        wanted_names.add(entry)
                 info = self._filter_device_parameters(
                     info, wanted_indices, wanted_names)
             return {
@@ -3361,7 +3404,15 @@ class AbletonMCP(ControlSurface):
                 selected = list(range(len(self._song.tracks)))
             else:
                 wanted = set()
-                for entry in track_indices:
+                for entry in _require_list_selector(
+                        track_indices, "track_indices"):
+                    # SI-241: the same rule as parameter_indices -
+                    # only a real int selects (bools excluded); every
+                    # other entry is unusable and skipped, never
+                    # truncated or coerced, with the SI-240 catch
+                    # retained for the conversion itself.
+                    if type(entry) is not int:
+                        continue
                     try:
                         wanted.add(int(entry))
                     except (TypeError, ValueError, OverflowError):
