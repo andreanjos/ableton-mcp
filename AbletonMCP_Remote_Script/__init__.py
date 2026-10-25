@@ -233,6 +233,27 @@ def _coerce_page_int(value, default, maximum=None, minimum=0):
     return number
 
 
+def _require_hashable_cache_key(value, field):
+    """Refuse a browser cache-key component that cannot be hashed.
+
+    MCP-07 keys its browser caches on caller-supplied values
+    (SI-237): a list or dict used as a key component crashes the
+    lookup itself with a raw "unhashable type: ..." interpreter
+    message, before the handler's own logic runs. A value that can
+    never serve as a cache key is refused by name here instead, in
+    the SI-71 entry-refusal style. Hashable values pass through
+    untouched - including the legacy hashable non-string scalars
+    (a category_type of 42 succeeds softly, a path of 42 fails
+    later in its handler exactly as before); only the unhashable
+    shapes change.
+    """
+    try:
+        hash(value)
+    except TypeError:
+        raise ValueError("Invalid {0}: must be a string".format(field))
+    return value
+
+
 def _finish_agent0_timing(response, timing_state):
     """Attach the agent0_timing block to a response envelope.
 
@@ -2083,6 +2104,9 @@ class AbletonMCP(ControlSurface):
         could keep pointing at an item the library no longer has.
         """
         if current_depth == 0:
+            # SI-237: refuse an unhashable uri by name before it
+            # can crash the memo lookup as a raw TypeError.
+            _require_hashable_cache_key(uri, "uri")
             uri_cache, _ = self._browser_cache_state()
             cached = self._browser_cache_get(uri_cache, uri)
             if cached is not None:
@@ -3646,6 +3670,9 @@ class AbletonMCP(ControlSurface):
             # the read cache without re-walking the browser; the cache
             # is invalidated on load and on refresh_browser_cache.
             _, read_cache = self._browser_cache_state()
+            # SI-237: refuse an unhashable category_type by name
+            # before it can crash the cache lookup as a raw TypeError.
+            _require_hashable_cache_key(category_type, "category_type")
             cache_key = ("tree", category_type)
             cached = self._browser_cache_get(read_cache, cache_key)
             if cached is not None:
@@ -3812,6 +3839,10 @@ class AbletonMCP(ControlSurface):
             # re-navigating the browser; the cache is invalidated
             # on load and on refresh_browser_cache.
             _, read_cache = self._browser_cache_state()
+            # SI-237: refuse an unhashable path by name before it
+            # can crash the cache lookup as a raw TypeError (the
+            # key below embeds the raw path in both its forms).
+            _require_hashable_cache_key(path, "path")
             # SI-75: coerce the paging values BEFORE building the
             # cache key. Keying on the raw values crashed the lookup
             # on unhashable shapes (limit=[1] -> "unhashable type:

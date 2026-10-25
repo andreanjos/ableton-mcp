@@ -29,6 +29,15 @@ property counts every hierarchy descent:
   coercion now treats as unusable alongside TypeError and
   ValueError - NaN already fell back - while a finite
   huge value still clamps to the cap;
+* the remaining browser cache keys refuse unhashable key
+  components by name (SI-237): get_browser_tree keys on the raw
+  category_type, get_browser_items_at_path still embeds the
+  raw path (SI-75 coerced only its paging values), and the
+  get_browser_item URI memo keys on the raw uri, so a list or
+  dict crashed each lookup with a raw "unhashable type: ..."
+  message; those shapes now refuse as "Invalid <field>: must
+  be a string", write no cache entry, and hashable non-string
+  scalars (42, None) keep their exact legacy behaviour;
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -597,6 +606,104 @@ def test_paging_finite_huge_values_still_clamp_not_fall_back():
     assert items["total"] == 10 and len(items["items"]) == 10
     _, read_cache = inst._browser_cache_state()
     assert ("items", "drums/Kits", 1000, 0) in read_cache
+
+
+# ── Unhashable browser cache-key components refused (SI-237) ──────
+
+def test_browser_tree_unhashable_category_type_is_refused_by_name():
+    # The read-cache key is ("tree", category_type) on the raw
+    # value, so a list/dict crashed the lookup with a raw
+    # "unhashable type: ..." envelope before the handler ran.
+    # Each shape runs on a fresh instance (cold cache): the
+    # refusal is named, no cache entry is written, and a valid
+    # read on the same instance still succeeds afterwards.
+    for bad in ([1], {"a": 1}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        response = inst._process_command(
+            {"type": "get_browser_tree", "params": {"category_type": bad}})
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "Invalid category_type: must be a string")
+        assert response["result"] == {}
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        result = wire(inst, "get_browser_tree",
+                      {"category_type": "instruments"})
+        assert result["type"] == "instruments"
+
+
+def test_items_at_path_unhashable_path_is_refused_by_name():
+    # SI-75 coerced the paging values, but the key still embeds
+    # the raw path in both its unpaged and paged forms, so a
+    # list/dict path crashed the lookup the same way.
+    for params in ({"path": [1]},
+                   {"path": {"a": 1}},
+                   {"path": [1], "limit": 5},
+                   {"path": {"a": 1}, "offset": 0}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        response = inst._process_command(
+            {"type": "get_browser_items_at_path", "params": params})
+        assert response["status"] == "error", response
+        assert response["message"] == "Invalid path: must be a string"
+        assert response["result"] == {}
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        result = wire(inst, "get_browser_items_at_path",
+                      {"path": "instruments"})
+        assert result["name"] == "Instruments"
+
+
+def test_browser_item_unhashable_uri_is_refused_by_name():
+    # The URI memo (_find_browser_item_by_uri) keys on the raw
+    # uri, so a list/dict uri crashed the memo lookup with the
+    # same raw TypeError envelope.
+    for bad in ([1], {"a": 1}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        response = inst._process_command(
+            {"type": "get_browser_item", "params": {"uri": bad}})
+        assert response["status"] == "error", response
+        assert response["message"] == "Invalid uri: must be a string"
+        assert response["result"] == {}
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        result = wire(inst, "get_browser_item", {"uri": "fake:808"})
+        assert result["item"]["name"] == "808 Core Kit"
+
+
+def test_browser_cache_key_hashable_scalars_are_unchanged():
+    # The SI-237 refusal covers unhashable values only: hashable
+    # non-string scalars keep their exact base behaviour - a
+    # category_type of 42 succeeds softly with no categories, a
+    # path of 42 still fails downstream in the handler (never
+    # reaching a cache write), and a uri of 42 or None still
+    # resolves to a plain not-found result.
+    counter = WalkCounter()
+    inst = make_instance(build_browser(counter))
+    result = wire(inst, "get_browser_tree", {"category_type": 42})
+    assert result["type"] == 42 and result["categories"] == []
+    result = wire(inst, "get_browser_tree", {"category_type": None})
+    assert result["type"] is None and result["categories"] == []
+
+    for bad_path, message in (
+            (42, "'int' object has no attribute 'split'"),
+            (None, "'NoneType' object has no attribute 'split'")):
+        inst = make_instance(build_browser(WalkCounter()))
+        response = inst._process_command(
+            {"type": "get_browser_items_at_path",
+             "params": {"path": bad_path}})
+        assert response["status"] == "error", response
+        assert response["message"] == message
+        _, read_cache = inst._browser_cache_state()
+        assert len(read_cache) == 0
+
+    inst = make_instance(build_browser(WalkCounter()))
+    result = wire(inst, "get_browser_item", {"uri": 42})
+    assert result["found"] is False and result["uri"] == 42
+    result = wire(inst, "get_browser_item", {"uri": None})
+    assert result["found"] is False and result["uri"] is None
 
 
 # ── search_browser ───────────────────────────────────────────────────
