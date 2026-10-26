@@ -136,7 +136,19 @@ def infer_intent_op_label(text: str, level: int) -> str:
 
 
 def label_action(tool: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return {op_level, op_label, category_hint} for an MCP tool action."""
+    """Return {op_level, op_label, category_hint} for an MCP tool action.
+
+    ``tool`` is normalised by :func:`_normalised_text`: a non-string
+    tool is treated as absent (``""``), exactly as a non-string
+    ``intent_text`` is. Direct callers pass registry tool names, but
+    :func:`enrich_export_row` feeds this function ``tool`` straight
+    from a stored row, so a row serialised with a non-string tool
+    (``123``, a list, bytes, ...) must degrade to the unknown-action
+    result an empty tool name already produces -- level 1 with an
+    empty label -- instead of raising ``AttributeError`` (or, for
+    bytes, ``TypeError``) on the ``startswith`` check below.
+    """
+    tool = _normalised_text(tool)
     params = params or {}
     if tool.startswith("human_"):
         return {
