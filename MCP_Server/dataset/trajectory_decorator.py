@@ -177,19 +177,40 @@ def _extract_params(kwargs: dict) -> dict[str, Any]:
         if key not in kwargs or kwargs[key] is None:
             continue
         value = kwargs[key]
-        if key == "path" and isinstance(value, str):
-            if _is_browser_path(value):
-                params["browser_path"] = value[:500]
-            else:
-                import os as _os
+        if key == "path":
+            if isinstance(value, str):
+                if _is_browser_path(value):
+                    params["browser_path"] = value[:500]
+                else:
+                    import os as _os
 
-                params["file_extension"] = _os.path.splitext(value)[1].lower() or "unknown"
+                    params["file_extension"] = _os.path.splitext(value)[1].lower() or "unknown"
+                    params["has_path"] = True
+            else:
+                # SI-248: a non-string path (e.g. bytes from a non-conforming
+                # caller) must not fall through to raw storage below -- the
+                # scrub is the privacy gate and cannot rest on the caller's
+                # type annotation. Reduce it to the same metadata-only shape
+                # a string file path gets, with no extension to report.
+                params["file_extension"] = "unknown"
                 params["has_path"] = True
             continue
         if key == "name":
             from .snapshot import _scrub_name
 
-            params[key] = _scrub_name(value)
+            if isinstance(value, str):
+                params[key] = _scrub_name(value)
+            else:
+                # SI-248: _scrub_name returns non-strings unchanged, which
+                # would store a bytes/container name verbatim. Reduce any
+                # non-string name to the same length-only placeholder a
+                # user-authored string name gets; values with no length
+                # report 0. No content is stored.
+                try:
+                    _name_len = len(value)
+                except TypeError:
+                    _name_len = 0
+                params[key] = f"<name:{_name_len}>"
             continue
         if key in _FREE_TEXT_KEYS and isinstance(value, str):
             from .recorder import scrub_text

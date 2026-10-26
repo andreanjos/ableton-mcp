@@ -51,6 +51,12 @@ def _extract_tool_params(kwargs: dict, capture_notes: bool = False) -> dict:
     for key in capture_keys:
         if key in kwargs and kwargs[key] is not None:
             value = kwargs[key]
+            # SI-248: a non-string name (e.g. bytes) would otherwise be
+            # stored verbatim below. String names are captured raw with
+            # consent by design; a non-string has no consented string form,
+            # so drop it rather than store the raw value.
+            if key == "name" and not isinstance(value, str):
+                continue
             # Truncate long strings
             if isinstance(value, str) and len(value) > 500:
                 value = value[:500] + "..."
@@ -93,8 +99,23 @@ def _extract_tool_params(kwargs: dict, capture_notes: bool = False) -> dict:
                     return f"{note}{octave}"
 
                 # Summary: list of [note_name, start, duration, velocity]
+                # SI-248: convert each pitch defensively. pitch_to_name does
+                # arithmetic/indexing on the raw pitch, so a string, NaN,
+                # float, list or None pitch raised here and -- inside the
+                # wrappers' swallow-all finally -- silently dropped the whole
+                # telemetry event. A pitch that cannot be named now gets a
+                # "?" placeholder in its own readable entry (keeping the
+                # readable list aligned with the compact list); the compact
+                # entry and every other note/event field are unaffected.
+                def _readable_note(n):
+                    try:
+                        note_name = pitch_to_name(n[0])
+                    except Exception:
+                        note_name = "?"
+                    return [note_name, n[1], n[2], n[3]]
+
                 params['notes_readable'] = [
-                    [pitch_to_name(n[0]), n[1], n[2], n[3]] for n in compact_notes[:100]  # Limit to 100 for readability
+                    _readable_note(n) for n in compact_notes[:100]  # Limit to 100 for readability
                 ]
                 if len(compact_notes) > 100:
                     params['notes_truncated'] = True
