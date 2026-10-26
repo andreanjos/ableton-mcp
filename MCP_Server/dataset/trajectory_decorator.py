@@ -83,6 +83,14 @@ _FREE_TEXT_KEYS = frozenset({"text", "note", "search_query"})
 # stored by design; non-strings are dropped (see _extract_params).
 _URI_KEYS = frozenset({"uri", "rack_uri", "kit_path"})
 
+# Params whose legitimate form is a plain string (SI-254): the rating and
+# category enums, and the pairwise candidate ids / labels / winner. Strings
+# are stored by design (truncated below); non-strings are dropped (see
+# _extract_params). `tags` is handled separately in _extract_params: its
+# tool-boundary form is a comma-separated string, but the recorder schema
+# types it list[str], so a list of strings is also a legitimate form.
+_STR_KEYS = frozenset({"rating", "winner", "candidate_a", "candidate_b", "category_type"})
+
 
 def _light_snapshots() -> bool:
     flag = os.environ.get("ABLETON_MCP_DATASET_LIGHT", "").strip().lower()
@@ -242,6 +250,32 @@ def _extract_params(kwargs: dict) -> dict[str, Any]:
             # than store the raw value -- the telemetry non-string name
             # drop is the precedent in the sibling extractor.
             continue
+        if key in _STR_KEYS and not isinstance(value, str):
+            # SI-254: the remaining string-typed keys (rating / winner /
+            # candidate_a / candidate_b / category_type) fell through the
+            # isinstance gate below and stored any non-string verbatim --
+            # the same fall-through SI-253 closed for free-text/uri keys.
+            # Their string forms are stored by design (enums and candidate
+            # ids/labels, truncated below); a non-string has no legitimate
+            # form here, so drop it rather than store it raw.
+            continue
+        if key == "tags":
+            # SI-254: tags is string-typed at the tool boundary
+            # (rate_last_action(tags: str), comma-separated), but the
+            # recorder schema types it list[str] (schema.make_preference /
+            # recorder.record_preference) -- the server itself splits the
+            # string into a list before recording. A list whose items are
+            # all strings is therefore a legitimate form and is stored
+            # unchanged; every other non-string (bytes included, and any
+            # list carrying a non-string item) is legitimate under neither
+            # reading, so drop it rather than store it raw. A plain string
+            # falls through to the truncation/storage below, unchanged.
+            if isinstance(value, list):
+                if all(isinstance(item, str) for item in value):
+                    params[key] = value
+                continue
+            if not isinstance(value, str):
+                continue
         if isinstance(value, str) and len(value) > 500:
             value = value[:500] + "..."
         params[key] = value
