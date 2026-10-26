@@ -2186,6 +2186,19 @@ class AbletonMCP(ControlSurface):
             
             # If URI not provided or not found, try by path
             if path:
+                # SI-246: refuse a non-string path by name before it
+                # can die at the split below with a raw interpreter
+                # message (SI-239 F7). The URI side of this handler
+                # was refused by name in SI-237; the path side was
+                # outside that sweep and no cache key is involved.
+                # _require_string is the SI-243 helper, the same one
+                # _create_audio_clip uses for its path. The guard
+                # sits inside the truthiness branch, so the omitted
+                # path (the dispatchers default of None) and every
+                # other falsy value keep their exact prior behaviour
+                # - they never reached the split - and a URI hit
+                # above still returns before path navigation.
+                path = _require_string(path, "path")
                 # Parse the path and navigate to the specified item
                 path_parts = path.split("/")
                 
