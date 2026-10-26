@@ -361,6 +361,23 @@ def _require_string(value, field):
     return value
 
 
+def _require_bool(value, field):
+    """Refuse a value that is not a real bool, by name.
+
+    Boolean fields read by truthiness take the TRUE branch for the
+    string "false" - the most likely wrong-type bool a JSON caller
+    sends (SI-244, for the note ``mute`` field; the wider
+    truthiness family is SI-239 F6). A non-bool mute forwarded to
+    Clip.set_notes can never be honoured as sent, so it is refused
+    by name here instead, in the SI-237 entry-refusal style. Real
+    bools pass through untouched.
+    """
+    if not isinstance(value, bool):
+        raise ValueError(
+            "Invalid {0}: must be a boolean".format(field))
+    return value
+
+
 def _finish_agent0_timing(response, timing_state):
     """Attach the agent0_timing block to a response envelope.
 
@@ -1648,14 +1665,42 @@ class AbletonMCP(ControlSurface):
             
             clip = clip_slot.clip
             
-            # Convert note data to Live's format
+            # Convert note data to Live's format. SI-244 (SI-239
+            # F5): the container, the entries and every provided
+            # field are validated by name before anything reaches
+            # Clip.set_notes - a non-list notes, a non-dict entry
+            # and bad field values (pitch "A", a NaN pitch, an
+            # infinite start_time, a list velocity) all used to
+            # fail raw or report success with the bad tuple
+            # delivered. Validation runs here, after the clip is
+            # fetched, so the no-clip refusal keeps its precedence,
+            # and the whole list is converted before set_notes is
+            # called, so a bad entry anywhere means set_notes is
+            # never called at all.
+            notes = _require_list_selector(notes, "notes")
             live_notes = []
             for note in notes:
+                if not isinstance(note, dict):
+                    raise ValueError(
+                        "Invalid notes: entries must be objects")
                 pitch = note.get("pitch", 60)
                 start_time = note.get("start_time", 0.0)
                 duration = note.get("duration", 0.25)
                 velocity = note.get("velocity", 100)
                 mute = note.get("mute", False)
+                # _require_finite_number validates only here: its
+                # int-to-float return is deliberately NOT used,
+                # because this handler has always forwarded the
+                # caller's values verbatim (an int pitch reached
+                # set_notes as an int) - using the return would
+                # change every well-formed tuple's types. Bools
+                # are excluded from numbers by that helper, as
+                # the SI-242/SI-243 rules require.
+                _require_finite_number(pitch, "pitch")
+                _require_finite_number(start_time, "start_time")
+                _require_finite_number(duration, "duration")
+                _require_finite_number(velocity, "velocity")
+                mute = _require_bool(mute, "mute")
                 
                 live_notes.append((pitch, start_time, duration, velocity, mute))
             
