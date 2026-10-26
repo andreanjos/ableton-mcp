@@ -2684,6 +2684,15 @@ class AbletonMCP(ControlSurface):
 
     def _map_rack_magnitude(self, track_index, device_index=0, macro_name="Magnitude"):
         """Rename Macro 1 and map nested Dry/Wet (or Mix/Amount) params to it."""
+        # SI-251: refuse a non-string macro_name by name before it
+        # can reach either naming path unchecked - the primary
+        # rack.rename_macro(0, macro_name) call is unguarded, and
+        # the fallback assigns rack.parameters[1].name = macro_name
+        # (SI-243 review N1; probed list/123/None/dict forwarded
+        # verbatim and echoed as success). _require_string is the
+        # SI-243 helper; strings (and the dispatcher's "Magnitude"
+        # default) pass through untouched.
+        macro_name = _require_string(macro_name, "macro_name")
         track_index = _require_index(
             track_index, "track_index", len(self._song.tracks),
             "Track index out of range")
