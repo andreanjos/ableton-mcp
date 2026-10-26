@@ -306,6 +306,61 @@ def _require_index(value, field, count, range_message=None):
     return value
 
 
+def _require_finite_number(value, field):
+    """Refuse a value that is not a finite real number, by name.
+
+    The value-taking handlers forwarded caller values to the Live
+    object model unchecked (SI-243 / SI-239 F4): set_tempo assigned
+    NaN, "fast", [120], None and True to Song.tempo verbatim and
+    reported success; set_device_parameter stored NaN and silently
+    clamped +/-Infinity to the parameter's max/min; the float()-
+    converted time handlers accepted NaN/+/-Infinity and numeric
+    strings while None/list died with raw float() interpreter
+    messages; create_clip forwarded its length verbatim. A value
+    that is not a finite number can never be honoured as sent, so
+    it is refused by name here instead, in the SI-237 entry-refusal
+    style.
+
+    Only real int/float values pass: bools are excluded (a bool is
+    not a number for value purposes - the SI-242 index rule), and
+    numeric strings are NOT coerced ("0.5" refuses, it does not
+    become 0.5 - the SI-241 digit-string non-coercion ruling for
+    selector entries, applied to values). A passing int is returned
+    as its float, exactly what the handlers' own float() conversion
+    produced for every valid value before this row; a passing float
+    is returned untouched.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            "Invalid {0}: must be a finite number".format(field))
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(
+            "Invalid {0}: must be a finite number".format(field))
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(
+            "Invalid {0}: must be a finite number".format(field))
+    return number
+
+
+def _require_string(value, field):
+    """Refuse a value that is not a string, by name.
+
+    The name setters assigned caller values verbatim (SI-243 /
+    SI-239 F4): set_track_name stored a list or None as the track
+    name and echoed it back as success, and create_locator silently
+    stringified a list name to "['x']". A non-string name can never
+    be honoured as sent, so it is refused by name here instead, in
+    the SI-237 entry-refusal style - the same isinstance(value, str)
+    check the SI-241 selector name entries use. Strings pass through
+    untouched, the empty string included.
+    """
+    if not isinstance(value, str):
+        raise ValueError("Invalid {0}: must be a string".format(field))
+    return value
+
+
 def _finish_agent0_timing(response, timing_state):
     """Attach the agent0_timing block to a response envelope.
 
@@ -1478,6 +1533,7 @@ class AbletonMCP(ControlSurface):
             
             # Set the name
             track = self._song.tracks[track_index]
+            name = _require_string(name, "name")
             track.name = name
             
             result = {
@@ -1508,6 +1564,7 @@ class AbletonMCP(ControlSurface):
                 raise Exception("Clip slot already has a clip")
             
             # Create the clip
+            length = _require_finite_number(length, "length")
             clip_slot.create_clip(length)
             
             result = {
@@ -1529,6 +1586,8 @@ class AbletonMCP(ControlSurface):
         try:
             if not path:
                 raise ValueError("Audio file path is required")
+
+            _require_string(path, "path")
 
             if not os.path.isabs(path):
                 raise ValueError("Audio file path must be absolute (got: %s)" % path)
@@ -1630,6 +1689,7 @@ class AbletonMCP(ControlSurface):
                 raise Exception("No clip in slot")
             
             clip = clip_slot.clip
+            name = _require_string(name, "name")
             clip.name = name
             
             result = {
@@ -1659,6 +1719,7 @@ class AbletonMCP(ControlSurface):
                 "Clip index out of range")
 
             clip = arrangement_clips[clip_index]
+            name = _require_string(name, "name")
             clip.name = name
 
             result = {
@@ -1672,6 +1733,7 @@ class AbletonMCP(ControlSurface):
     def _set_tempo(self, tempo):
         """Set the tempo of the session"""
         try:
+            tempo = _require_finite_number(tempo, "tempo")
             self._song.tempo = tempo
             
             result = {
@@ -1801,7 +1863,8 @@ class AbletonMCP(ControlSurface):
     def _set_current_song_time(self, time_val):
         """Move the arrangement playhead to a position in beats"""
         try:
-            self._song.current_song_time = float(time_val)
+            self._song.current_song_time = _require_finite_number(
+                time_val, "time")
             return {"current_song_time": self._song.current_song_time}
         except Exception as e:
             self.log_message("Error setting current song time: " + str(e))
@@ -1938,7 +2001,9 @@ class AbletonMCP(ControlSurface):
             clip = clip_slot.clip
 
             # Duplicate to arrangement at the requested beat position
-            track.duplicate_clip_to_arrangement(clip, float(destination_time))
+            track.duplicate_clip_to_arrangement(
+                clip, _require_finite_number(
+                    destination_time, "destination_time"))
 
             return {
                 "success": True,
@@ -1961,7 +2026,8 @@ class AbletonMCP(ControlSurface):
         """
         try:
             song = self._song
-            target_time = float(time_val)
+            name = _require_string(name, "name")
+            target_time = _require_finite_number(time_val, "time")
             tolerance = 1e-3
 
             # See if a cue already exists at (or near) the target time
@@ -1992,7 +2058,7 @@ class AbletonMCP(ControlSurface):
 
             if name:
                 try:
-                    existing.name = str(name)
+                    existing.name = name
                 except Exception as e:
                     self.log_message("Could not rename locator: " + str(e))
 
@@ -3594,7 +3660,7 @@ class AbletonMCP(ControlSurface):
                 "Parameter index out of range")
             param = device.parameters[parameter_index]
             old = float(param.value)
-            param.value = float(value)
+            param.value = _require_finite_number(value, "value")
             return {
                 "track_index": track_index,
                 "device_index": device_index,

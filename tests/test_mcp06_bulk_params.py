@@ -803,3 +803,64 @@ def test_bulk_parameter_index_controls_unchanged(script_module):
     item = out["result"]["results"][0]
     assert item["status"] == "error", item
     assert item["message"] == "Parameter index out of range"
+
+
+# ------------------------------------------------- SI-243 value validation
+
+FINITE_MESSAGE = "Invalid value: must be a finite number"
+
+
+def test_single_set_bad_values_refused_by_name(script_module):
+    # SI-243: NaN was stored verbatim, +/-Inf silently clamped to
+    # max/min, "0.5"/True coerced via float(), and "loud"/[0.5]/None
+    # died with raw float() messages. Every shape now refuses by name
+    # with zero writes.
+    bad = [float("nan"), float("inf"), float("-inf"), "0.5", "loud",
+           [0.5], {"x": 1}, None, True, False]
+    for value in bad:
+        inst = make_instance(script_module)
+        before = _param_values(inst)
+        response = single_set_via_wire(inst, 0, value)
+        assert response["status"] == "error", (value, response)
+        assert response["message"] == FINITE_MESSAGE, (value, response)
+        assert _param_values(inst) == before, value
+
+
+def test_single_set_valid_values_still_apply(script_module):
+    # Controls: finite numbers apply exactly as before (an int value
+    # lands as its float, as the old float() conversion produced).
+    for value, landed in [(0.7, 0.7), (1, 1.0), (0, 0.0)]:
+        inst = make_instance(script_module)
+        response = single_set_via_wire(inst, 0, value)
+        assert response["status"] == "success", (value, response)
+        assert response["result"]["value"] == landed, (value, response)
+        assert _param_values(inst)[0] == landed, value
+
+
+def test_bulk_set_bad_value_refused_per_item_by_name(script_module):
+    # SI-243: the bulk path inherits the single set's validation per
+    # item - a bad value is a per-item by-name refusal (with the
+    # direct call's "result": {} envelope), sibling items still apply,
+    # and the documented missing-value default (0.0) is unchanged.
+    inst = make_instance(script_module)
+    before = _param_values(inst)
+    response = bulk_set_via_wire(inst, [
+        {"parameter_index": 0, "value": float("nan")},
+        {"parameter_index": 1, "value": "0.7"},
+        {"parameter_index": 2, "value": 0.7},
+        {"parameter_index": 3},
+    ])
+    assert response["status"] == "success", response
+    results = response["result"]["results"]
+    assert results[0]["status"] == "error", results
+    assert results[0]["message"] == FINITE_MESSAGE, results
+    assert results[0]["result"] == {}, results
+    assert results[1]["status"] == "error", results
+    assert results[1]["message"] == FINITE_MESSAGE, results
+    assert results[2]["status"] == "success", results
+    assert results[3]["status"] == "success", results
+    after = _param_values(inst)
+    assert after[0] == before[0]
+    assert after[1] == before[1]
+    assert after[2] == 0.7
+    assert after[3] == 0.0
