@@ -63,6 +63,12 @@ def _extract_tool_params(kwargs: dict, capture_notes: bool = False) -> dict:
             # verbatim and has no consented string form.
             if key in ("uri", "rack_uri", "kit_path") and not isinstance(value, str):
                 continue
+            # SI-254: same drop for category_type, the remaining
+            # string-typed key in this extractor (a browser-category enum
+            # in get_browser_tree). String values are captured raw with
+            # consent by design; a non-string was stored verbatim.
+            if key == "category_type" and not isinstance(value, str):
+                continue
             # Truncate long strings
             if isinstance(value, str) and len(value) > 500:
                 value = value[:500] + "..."
