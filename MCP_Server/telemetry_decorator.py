@@ -57,6 +57,12 @@ def _extract_tool_params(kwargs: dict, capture_notes: bool = False) -> dict:
             # so drop it rather than store the raw value.
             if key == "name" and not isinstance(value, str):
                 continue
+            # SI-253: same drop for the uri-type keys (uri / rack_uri /
+            # kit_path). String URIs are captured raw with consent by
+            # design; a non-string (e.g. bytes kit_path) was stored
+            # verbatim and has no consented string form.
+            if key in ("uri", "rack_uri", "kit_path") and not isinstance(value, str):
+                continue
             # Truncate long strings
             if isinstance(value, str) and len(value) > 500:
                 value = value[:500] + "..."

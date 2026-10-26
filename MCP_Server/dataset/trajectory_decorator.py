@@ -79,6 +79,10 @@ _AUDIO_EXTS = frozenset({
 # so they get the same email/path scrub the intent text gets.
 _FREE_TEXT_KEYS = frozenset({"text", "note", "search_query"})
 
+# Params whose string form is a Live URI / browser identifier. Strings are
+# stored by design; non-strings are dropped (see _extract_params).
+_URI_KEYS = frozenset({"uri", "rack_uri", "kit_path"})
+
 
 def _light_snapshots() -> bool:
     flag = os.environ.get("ABLETON_MCP_DATASET_LIGHT", "").strip().lower()
@@ -208,16 +212,35 @@ def _extract_params(kwargs: dict) -> dict[str, Any]:
                 # report 0. No content is stored.
                 try:
                     _name_len = len(value)
-                except TypeError:
+                except Exception:
+                    # SI-253 (SI-248 N2): a __len__ raising anything other
+                    # than TypeError (e.g. ValueError) must not propagate
+                    # either -- the placeholder reports 0 for any value
+                    # whose length cannot be taken.
                     _name_len = 0
                 params[key] = f"<name:{_name_len}>"
             continue
-        if key in _FREE_TEXT_KEYS and isinstance(value, str):
+        if key in _FREE_TEXT_KEYS:
+            if not isinstance(value, str):
+                # SI-253: a non-string free-text value (e.g. bytes) fell
+                # through the isinstance gate below and was stored verbatim,
+                # bypassing scrub_text entirely -- the same privacy class
+                # SI-248 closed for path/name. scrub_text has no non-string
+                # form and a scrubbed-to-nothing string is dropped, so drop
+                # a non-string here too rather than store it raw.
+                continue
             from .recorder import scrub_text
 
             cleaned = scrub_text(value, 500)
             if cleaned is not None:
                 params[key] = cleaned
+            continue
+        if key in _URI_KEYS and not isinstance(value, str):
+            # SI-253: string URIs are stored by design (consented/internal
+            # identifiers, truncated below); a non-string URI (e.g. bytes
+            # kit_path) has no consented string form, so drop it rather
+            # than store the raw value -- the telemetry non-string name
+            # drop is the precedent in the sibling extractor.
             continue
         if isinstance(value, str) and len(value) > 500:
             value = value[:500] + "..."
