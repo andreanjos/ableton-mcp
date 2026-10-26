@@ -370,7 +370,11 @@ def _require_bool(value, field):
     truthiness family is SI-239 F6). A non-bool mute forwarded to
     Clip.set_notes can never be honoured as sent, so it is refused
     by name here instead, in the SI-237 entry-refusal style. Real
-    bools pass through untouched.
+    bools pass through untouched. SI-245 reuses this helper for the
+    rest of the F6 family: the dispatcher ``timing`` opt-in, the
+    ``set_passive_listeners`` ``enabled`` flag, both
+    ``stop_on_error`` flags, and the MCP-05 projection
+    ``include_*`` flags.
     """
     if not isinstance(value, bool):
         raise ValueError(
@@ -874,6 +878,16 @@ class AbletonMCP(ControlSurface):
         # do not opt in take the historical path untouched: no clock reads
         # beyond this membership check and no extra response keys.
         timing_state = None
+        # SI-245: the timing opt-in is a real bool or absent. A
+        # truthiness read opted a caller sending "false" INTO
+        # timing; refuse any other type by name, in the style of
+        # the request-id guard below (this head runs before the
+        # dispatch try, so the envelope is returned directly).
+        if "timing" in command:
+            try:
+                _require_bool(command.get("timing"), "timing")
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
         if "request_id" in command or command.get("timing"):
             if "request_id" in command and not _is_valid_request_id(command.get("request_id")):
                 return {"status": "error", "message": "Invalid request ID"}
@@ -1159,8 +1173,14 @@ class AbletonMCP(ControlSurface):
                 def main_thread_task():
                     try:
                         if "enabled" in params:
+                            # SI-245: pass the caller's value through
+                            # untouched - _set_passive_listeners
+                            # requires a real bool by name; the old
+                            # bool(...) cast here took the TRUE branch
+                            # for the string "false" before the
+                            # handler ever saw the value.
                             result = self._set_passive_listeners(
-                                bool(params.get("enabled")))
+                                params.get("enabled"))
                         else:
                             result = {
                                 "enabled": bool(getattr(
@@ -1252,7 +1272,18 @@ class AbletonMCP(ControlSurface):
             return {"status": "error",
                     "message": "execute_batch accepts at most %d commands"
                                % MAX_BATCH_COMMANDS}
-        stop_on_error = bool(params.get("stop_on_error", False))
+        # SI-245: stop_on_error is a real bool when sent (omitted
+        # keeps the default False). By truthiness the string
+        # "false" stopped the batch on the first error. Refused in
+        # this method's own early-guard style, above.
+        if "stop_on_error" in params:
+            try:
+                stop_on_error = _require_bool(
+                    params.get("stop_on_error"), "stop_on_error")
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
+        else:
+            stop_on_error = False
 
         response_queue = queue.Queue()
 
@@ -1423,6 +1454,13 @@ class AbletonMCP(ControlSurface):
             track_index = _require_index(
                 track_index, "track_index", len(self._song.tracks),
                 "Track index out of range")
+            # SI-245: projection flags are real bools. Read by
+            # truthiness, the string "false" included the section
+            # it was sent to omit.
+            include_clip_slots = _require_bool(
+                include_clip_slots, "include_clip_slots")
+            include_devices = _require_bool(
+                include_devices, "include_devices")
 
             track = self._song.tracks[track_index]
 
@@ -2785,7 +2823,9 @@ class AbletonMCP(ControlSurface):
         enabled script (or disabling a disabled one) changes nothing.
         Returns the resulting state for the command response.
         """
-        enabled = bool(enabled)
+        # SI-245: a real bool only - by truthiness the string
+        # "false" enabled the listeners.
+        enabled = _require_bool(enabled, "enabled")
         current = bool(getattr(self, "_passive_listeners_enabled", False))
         if enabled == current:
             return {
@@ -3584,6 +3624,34 @@ class AbletonMCP(ControlSurface):
         An omitted section is not serialised at all.
         """
         try:
+            # SI-245: projection flags are real bools. Read by
+            # truthiness, the string "false" included the section
+            # it was sent to omit (and reported include_notes /
+            # include_params back as true). include_automation is
+            # the one exception in shape, not in strictness: None
+            # is its documented no-override sentinel (the omitted
+            # behaviour, following include_params), so None passes
+            # and every other non-bool refuses by name.
+            include_notes = _require_bool(include_notes, "include_notes")
+            include_params = _require_bool(
+                include_params, "include_params")
+            include_scenes = _require_bool(
+                include_scenes, "include_scenes")
+            include_return_tracks = _require_bool(
+                include_return_tracks, "include_return_tracks")
+            include_master_track = _require_bool(
+                include_master_track, "include_master_track")
+            include_cue_points = _require_bool(
+                include_cue_points, "include_cue_points")
+            include_clip_slots = _require_bool(
+                include_clip_slots, "include_clip_slots")
+            include_devices = _require_bool(
+                include_devices, "include_devices")
+            include_arrangement_clips = _require_bool(
+                include_arrangement_clips, "include_arrangement_clips")
+            if include_automation is not None:
+                include_automation = _require_bool(
+                    include_automation, "include_automation")
             session = self._get_session_info()
             if track_indices is None:
                 selected = list(range(len(self._song.tracks)))
@@ -3765,7 +3833,18 @@ class AbletonMCP(ControlSurface):
                                % MAX_BULK_PARAMETERS}
         track_index = params.get("track_index", 0)
         device_index = params.get("device_index", 0)
-        stop_on_error = bool(params.get("stop_on_error", False))
+        # SI-245: stop_on_error is a real bool when sent (omitted
+        # keeps the default False), as in execute_batch - by
+        # truthiness the string "false" stopped on the first
+        # error. Refused in this method's own early-guard style.
+        if "stop_on_error" in params:
+            try:
+                stop_on_error = _require_bool(
+                    params.get("stop_on_error"), "stop_on_error")
+            except ValueError as e:
+                return {"status": "error", "message": str(e)}
+        else:
+            stop_on_error = False
 
         response_queue = queue.Queue()
 
