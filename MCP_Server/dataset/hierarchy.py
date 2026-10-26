@@ -61,15 +61,44 @@ _MUSICAL_OP_RE = re.compile(
 )
 
 
+def _normalised_level(value: Any) -> int | None:
+    """Return *value* only when it is a real int level in [1, 5].
+
+    Anything else -- bools (``type(True) is bool``, not ``int``), floats
+    (including integral floats, NaN and +/-Infinity), strings, containers
+    -- is treated as absent, exactly as the out-of-range ints 0 and 6
+    have always been treated: the caller falls back to text inference.
+    """
+    if type(value) is int and 1 <= value <= 5:
+        return value
+    return None
+
+
+def _normalised_text(value: Any) -> str:
+    """Return *value* only when it is a string; anything else is absent.
+
+    Stored/exported rows are data-shaped, so a non-string ``intent_text``
+    (a number, a list, bytes, ...) must degrade to "no text" instead of
+    raising the regex engine TypeError on the first pattern search.
+    """
+    return value if isinstance(value, str) else ""
+
+
 def infer_intent_level(text: str, explicit_level: int | None = None) -> int:
     """Infer Level 1–5 from intent text (explicit wins if provided).
 
     Ordered most-specific first: an atomic tweak is more specific than a
     musical operation, which is more specific than a section/song goal.
     Aesthetic and mix language stays at 5 — those are open-ended goals.
+
+    ``explicit_level`` is normalised by :func:`_normalised_level` and
+    ``text`` by :func:`_normalised_text`: unusable values are treated
+    as absent rather than compared or searched unchecked.
     """
-    if explicit_level is not None and 1 <= explicit_level <= 5:
-        return explicit_level
+    explicit = _normalised_level(explicit_level)
+    if explicit is not None:
+        return explicit
+    text = _normalised_text(text)
     if not text:
         return 5
     if _SONG_RE.search(text):
@@ -84,6 +113,7 @@ def infer_intent_level(text: str, explicit_level: int | None = None) -> int:
 
 
 def infer_intent_op_label(text: str, level: int) -> str:
+    text = _normalised_text(text)
     if not text:
         return "creative_goal"
     m = _SECTION_RE.search(text)
@@ -143,9 +173,18 @@ def label_intent(text: str, level: int | None = None) -> dict[str, Any]:
 def enrich_export_row(row: dict[str, Any]) -> dict[str, Any]:
     """Backfill hierarchy fields on an exported training row."""
     out = dict(row)
-    intent_text = out.get("intent_text") or ""
+    raw_text = out.get("intent_text")
+    # Text normalisation at this call site: a non-string intent_text is
+    # treated as absent for labelling. The guard below still keys on the
+    # raw values, so its truthiness is unchanged for every row (a present
+    # but unusable level such as 6 -- or "3" -- still triggers labelling,
+    # and a falsy text/level still does not). The stored fields in *out*
+    # are never rewritten: an invalid stored intent_level stays as
+    # stored, exactly as 0 and 6 already did, and only the derived
+    # intent_op_* fields reflect the normalised inference.
+    intent_text = raw_text if isinstance(raw_text, str) else ""
     intent_level = out.get("intent_level")
-    if intent_text or intent_level:
+    if raw_text or intent_level:
         labels = label_intent(intent_text, intent_level)
         out.setdefault("intent_level", labels["intent_level"])
         out["intent_op_label"] = labels["op_label"]
