@@ -171,3 +171,45 @@ def test_recorded_action_error_is_scrubbed(recorder):
         error="Error creating audio clip: no such file " + WINDOWS_PATH,
     )
     assert not _leaks(event.error)
+
+
+# ── SI-248: non-string path/name must not bypass the scrub ──────────────────
+
+def test_extract_params_reduces_a_bytes_file_path_to_metadata_only():
+    params = _extract_params({"path": b"/Users/ariadne/Music/Samples/kick.wav"})
+    assert params == {"file_extension": "unknown", "has_path": True}
+    assert not _leaks(params)
+
+
+def test_extract_params_reduces_a_bytearray_path_to_metadata_only():
+    params = _extract_params({"path": bytearray(b"/Users/ariadne/secret.wav")})
+    assert params == {"file_extension": "unknown", "has_path": True}
+    assert not _leaks(params)
+
+
+def test_extract_params_reduces_a_nonstring_path_value_to_metadata_only():
+    params = _extract_params({"path": 123})
+    assert params == {"file_extension": "unknown", "has_path": True}
+
+
+def test_extract_params_reduces_a_bytes_name_to_a_length_placeholder():
+    params = _extract_params({"name": b"ariadne demo v4"})
+    assert params == {"name": "<name:15>"}
+    assert not _leaks(params)
+
+
+def test_extract_params_reduces_a_bytearray_name_to_a_length_placeholder():
+    params = _extract_params({"name": bytearray(b"ariadne demo v4")})
+    assert params == {"name": "<name:15>"}
+    assert not _leaks(params)
+
+
+def test_extract_params_reduces_a_container_name_to_a_length_placeholder():
+    params = _extract_params({"name": ["ariadne demo"]})
+    assert params == {"name": "<name:1>"}
+    assert not _leaks(params)
+
+
+def test_extract_params_reduces_a_scalar_name_to_a_length_placeholder():
+    params = _extract_params({"name": 123})
+    assert params == {"name": "<name:0>"}
