@@ -45,6 +45,18 @@ _PATH_SEP_RE = re.compile(r"[\\/]+")
 # "take.na!me" has a short tail but is not an extension.
 _EXT_RE = re.compile(r"^[A-Za-z0-9]{1,8}$")
 
+# Depth bound for scrub_snapshot. The deepest snapshot the Remote Script
+# can legitimately produce is bounded by its rack-chain cap
+# (_MAX_CHAIN_DEPTH = 4 in the Remote Script): root -> tracks -> track ->
+# devices -> device -> chains -> chain -> devices -> ... -> device at
+# chain depth 4 -> parameters -> parameter is about 23 containers deep,
+# and every other section (clips/notes, scenes, sends) is shallower.
+# 100 is more than 4x that legitimate depth, so no real snapshot is
+# refused, while still stopping a malformed or hostile shape far below
+# the interpreter recursion limit (a nested dict costs two scrub frames
+# per level, so unbounded input raises RecursionError well before 2000).
+_MAX_SCRUB_DEPTH = 100
+
 
 def _scrub_path(value: Any) -> Any:
     """Replace a filesystem path with its shape: extension and segment count."""
@@ -78,21 +90,45 @@ def _scrub_name(value: Any) -> Any:
     return f"<name:{len(stripped)}>"
 
 
-def _scrub_value(key: str, value: Any) -> Any:
+def _scrub_value(key: str, value: Any, depth: int, ancestors: frozenset) -> Any:
     if key in _NAME_KEYS:
         return _scrub_name(value)
     if key in _PATH_KEYS:
         return _scrub_path(value)
-    return scrub_snapshot(value)
+    return _scrub_snapshot(value, depth, ancestors)
 
 
 def scrub_snapshot(node: Any) -> Any:
-    """Recursively redact user-authored names and filesystem paths."""
+    """Recursively redact user-authored names and filesystem paths.
+
+    A snapshot nested deeper than _MAX_SCRUB_DEPTH, or containing a
+    circular reference, is refused with ValueError -- the same refusal
+    voice stable_hash uses for a circular object (Circular reference
+    detected) -- instead of recursing without bound until
+    RecursionError. A container shared between two branches (a DAG,
+    not a cycle) is not circular: only ancestors on the current path
+    count, so shared sub-objects are scrubbed normally.
+    """
+    return _scrub_snapshot(node, 0, frozenset())
+
+
+def _scrub_snapshot(node: Any, depth: int, ancestors: frozenset) -> Any:
+    if not isinstance(node, (dict, list)):
+        return node
+    if id(node) in ancestors:
+        raise ValueError("Circular reference detected in snapshot")
+    if depth > _MAX_SCRUB_DEPTH:
+        raise ValueError(
+            "Snapshot is nested too deeply: maximum nesting depth is %d"
+            % _MAX_SCRUB_DEPTH
+        )
+    ancestors = ancestors | {id(node)}
     if isinstance(node, dict):
-        return {key: _scrub_value(key, value) for key, value in node.items()}
-    if isinstance(node, list):
-        return [scrub_snapshot(item) for item in node]
-    return node
+        return {
+            key: _scrub_value(key, value, depth + 1, ancestors)
+            for key, value in node.items()
+        }
+    return [_scrub_snapshot(item, depth + 1, ancestors) for item in node]
 
 
 def fetch_snapshot(
@@ -120,7 +156,15 @@ def fetch_snapshot(
         return None
     if raw is None:
         return None
-    return scrub_snapshot(raw)
+    try:
+        return scrub_snapshot(raw)
+    except ValueError as e:
+        # The scrub is the privacy gate on this single entry point: a
+        # snapshot it refuses (too deeply nested, or circular) degrades
+        # to the failure voice of this function -- None, with a warning --
+        # exactly as a failed fetch does, never to an exception.
+        logger.warning("Failed to scrub session snapshot: %s", e)
+        return None
 
 
 def snapshot_hash(snapshot: dict[str, Any] | None) -> str | None:

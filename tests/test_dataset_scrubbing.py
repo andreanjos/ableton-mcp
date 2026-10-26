@@ -213,3 +213,108 @@ def test_extract_params_reduces_a_container_name_to_a_length_placeholder():
 def test_extract_params_reduces_a_scalar_name_to_a_length_placeholder():
     params = _extract_params({"name": 123})
     assert params == {"name": "<name:0>"}
+# -- SI-250: scrub_snapshot depth bound and cycle guard ---------------------
+#
+# At base (c247c7e) every shape below raised RecursionError: a list or
+# dict nested 2000 deep, a self-referential dict, a self-referential
+# list, and a dict<->list cycle (SI-239 F11, probes D01-D03). Depth 200
+# was fine at base; it now refuses by design, because the bound is set
+# from the legitimate LOM shape (about 23 containers deep at the Remote
+# Script rack-chain cap of 4), not from the recursion limit: 100 is
+# more than 4x legitimate depth. The refusal voice is ValueError, the
+# same voice stable_hash uses for a circular object, and
+# fetch_snapshot degrades a refused scrub to its own failure voice:
+# None.
+
+def _nested_list(depth):
+    root = []
+    cur = root
+    for _ in range(depth):
+        nxt = []
+        cur.append(nxt)
+        cur = nxt
+    return root
+
+
+def _nested_dict(depth):
+    root = {}
+    cur = root
+    for _ in range(depth):
+        nxt = {}
+        cur["a"] = nxt
+        cur = nxt
+    return root
+
+
+def test_scrub_refuses_deeply_nested_list():
+    with pytest.raises(ValueError, match="nested too deeply"):
+        snapshot_mod.scrub_snapshot(_nested_list(2000))
+
+
+def test_scrub_refuses_deeply_nested_dict():
+    with pytest.raises(ValueError, match="nested too deeply"):
+        snapshot_mod.scrub_snapshot(_nested_dict(2000))
+
+
+def test_scrub_refuses_snapshot_just_over_the_bound():
+    over = snapshot_mod._MAX_SCRUB_DEPTH + 10
+    with pytest.raises(ValueError, match="nested too deeply"):
+        snapshot_mod.scrub_snapshot(_nested_list(over))
+
+
+def test_scrub_accepts_depth_well_above_any_real_snapshot():
+    # 50 containers deep is more than twice the deepest legitimate
+    # LOM snapshot (about 23) and must scrub byte-identically.
+    raw = _nested_list(50)
+    assert snapshot_mod.scrub_snapshot(raw) == raw
+    raw = _nested_dict(50)
+    assert snapshot_mod.scrub_snapshot(raw) == raw
+
+
+def test_scrub_refuses_circular_dict():
+    raw = {}
+    raw["self"] = raw
+    with pytest.raises(ValueError, match="Circular reference detected"):
+        snapshot_mod.scrub_snapshot(raw)
+
+
+def test_scrub_refuses_circular_list():
+    raw = []
+    raw.append(raw)
+    with pytest.raises(ValueError, match="Circular reference detected"):
+        snapshot_mod.scrub_snapshot(raw)
+
+
+def test_scrub_refuses_mixed_dict_list_cycle():
+    raw = {}
+    inner = [raw]
+    raw["inner"] = inner
+    with pytest.raises(ValueError, match="Circular reference detected"):
+        snapshot_mod.scrub_snapshot(raw)
+
+
+def test_scrub_allows_shared_subobject_that_is_not_a_cycle():
+    shared = {"name": "Kick", "file_path": POSIX_PATH}
+    raw = {"a": shared, "b": [shared]}
+    cleaned = snapshot_mod.scrub_snapshot(raw)
+    assert cleaned["a"]["file_path"] == "<path:5.wav>"
+    assert cleaned["b"][0]["file_path"] == "<path:5.wav>"
+    assert not _leaks(cleaned)
+
+
+def test_fetch_snapshot_returns_none_for_circular_snapshot():
+    raw = {}
+    raw["self"] = raw
+    assert snapshot_mod.fetch_snapshot(lambda *a, **k: raw) is None
+
+
+def test_fetch_snapshot_returns_none_for_deeply_nested_snapshot():
+    raw = _nested_list(2000)
+    assert snapshot_mod.fetch_snapshot(lambda *a, **k: raw) is None
+
+
+def test_fetch_snapshot_still_returns_scrubbed_normal_snapshot():
+    raw = {"tracks": [{"name": "chorus for ariadne", "file_path": POSIX_PATH}]}
+    cleaned = snapshot_mod.fetch_snapshot(lambda *a, **k: raw)
+    assert cleaned is not None
+    assert not _leaks(cleaned)
