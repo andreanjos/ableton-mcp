@@ -865,6 +865,10 @@ class AbletonMCP(ControlSurface):
 
     def _process_command(self, command):
         """Process a command from the client and return a response"""
+        # SI-249: a non-dict command cannot be dispatched; return the
+        # entry error envelope instead of escaping with AttributeError.
+        if not isinstance(command, dict):
+            return {"status": "error", "message": "Invalid command: must be an object"}
         command_type = command.get("type", "")
         params = command.get("params", {})
         if "type" in command and not isinstance(command_type, str):
