@@ -4189,6 +4189,20 @@ class AbletonMCP(ControlSurface):
             # can crash the cache lookup as a raw TypeError (the
             # key below embeds the raw path in both its forms).
             _require_hashable_cache_key(path, "path")
+            # SI-318: refuse a hashable non-string path by name as
+            # well. The hashable check above passes every hashable
+            # non-string (int, float, bool, tuple, bytes, explicit
+            # None), and each of those then died at path.split("/")
+            # below with a raw interpreter message - SI-246's exact
+            # defect in this sibling handler, which SI-246 did not
+            # touch. _require_string is the SI-243 helper SI-246
+            # used for _get_browser_item, producing the same refusal
+            # shape, "Invalid path: must be a string" - the same
+            # message the hashable check already gives unhashable
+            # shapes, so those controls are unchanged. Strings pass
+            # through untouched, the omitted-path default ("") and
+            # the paged/unpaged cache behaviour included.
+            path = _require_string(path, "path")
             # SI-75: coerce the paging values BEFORE building the
             # cache key. Keying on the raw values crashed the lookup
             # on unhashable shapes (limit=[1] -> "unhashable type:

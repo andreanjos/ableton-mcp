@@ -42,6 +42,17 @@ property counts every hierarchy descent:
   refusals are pinned directly as well, together with the
   remaining probed hashable controls - a uri of bytes and a
   category_type tuple (SI-238);
+* get_browser_items_at_path refuses a hashable non-string path
+  by name (SI-318): the SI-237 cache-key guard passes every
+  hashable non-string, so an int, float, bool, tuple, bytes or
+  explicit-null path died at path.split("/") with a raw
+  interpreter message - SI-246's exact defect in this sibling
+  handler; the handler now also runs _require_string, so the
+  refusal is "Invalid path: must be a string" (the message the
+  unhashable shapes already got from SI-237), and the SI-237
+  hashable-scalar control below is updated for this handler's
+  path only - category_type and uri scalars keep their exact
+  legacy behaviour;
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -659,6 +670,62 @@ def test_items_at_path_unhashable_path_is_refused_by_name():
         assert result["name"] == "Instruments"
 
 
+# ── Hashable non-string path refused by name (SI-318) ─────────────
+
+def _refused_items_at_path(inst, params):
+    response = inst._process_command(
+        {"type": "get_browser_items_at_path", "params": params})
+    assert response["status"] == "error", response
+    assert response["message"] == "Invalid path: must be a string"
+    assert response["result"] == {}
+
+
+def test_items_at_path_nonstring_path_is_refused_by_name():
+    # SI-317 D1, probed first-hand at base: every hashable
+    # non-string passed the SI-237 hashable check and died at
+    # path.split("/") with a raw interpreter message - int /
+    # float / bool / tuple / explicit None with "'X' object has
+    # no attribute 'split'", bytes with "a bytes-like object is
+    # required, not 'str'". Each shape runs on a fresh instance,
+    # unpaged and in both paged forms: the refusal is named, no
+    # cache entry is written, and a valid read on the same
+    # instance still succeeds afterwards.
+    for bad in (42, 4.5, True, ("Sounds",), b"Sounds", None):
+        for params in ({"path": bad},
+                       {"path": bad, "limit": 5},
+                       {"path": bad, "offset": 0}):
+            inst = make_instance(build_browser(WalkCounter()))
+            _refused_items_at_path(inst, params)
+            uri_cache, read_cache = inst._browser_cache_state()
+            assert len(uri_cache) == 0 and len(read_cache) == 0
+            result = wire(inst, "get_browser_items_at_path",
+                          {"path": "instruments"})
+            assert result["name"] == "Instruments"
+
+
+def test_items_at_path_valid_and_omitted_paths_are_unchanged():
+    # Controls, hand-checked from the base probe: a valid path
+    # succeeds exactly as at base, and an omitted path keeps the
+    # dispatcher's "" default - the existing unknown-category
+    # result, never a refusal (the unhashable controls for this
+    # handler are the SI-237 test above).
+    inst = make_instance(build_browser(WalkCounter()))
+    result = wire(inst, "get_browser_items_at_path",
+                  {"path": "Sounds"})
+    assert result == {"path": "Sounds", "name": "Sounds",
+                      "uri": "fake:sounds", "is_folder": False,
+                      "is_device": False, "is_loadable": False,
+                      "items": []}
+    result = wire(inst, "get_browser_items_at_path", {})
+    assert result == {
+        "path": "",
+        "error": "Unknown or unavailable category: ",
+        "available_categories": ["audio_effects", "drums",
+                                 "instruments", "midi_effects",
+                                 "sounds"],
+        "items": []}
+
+
 def test_browser_item_unhashable_uri_is_refused_by_name():
     # The URI memo (_find_browser_item_by_uri) keys on the raw
     # uri, so a list/dict uri crashed the memo lookup with the
@@ -680,10 +747,14 @@ def test_browser_item_unhashable_uri_is_refused_by_name():
 def test_browser_cache_key_hashable_scalars_are_unchanged():
     # The SI-237 refusal covers unhashable values only: hashable
     # non-string scalars keep their exact base behaviour - a
-    # category_type of 42 succeeds softly with no categories, a
-    # path of 42 still fails downstream in the handler (never
-    # reaching a cache write), and a uri of 42 or None still
-    # resolves to a plain not-found result.
+    # category_type of 42 succeeds softly with no categories, and
+    # a uri of 42 or None still resolves to a plain not-found
+    # result. The one exception is get_browser_items_at_path's
+    # path (SI-318): 42 and explicit None no longer fail
+    # downstream with the raw split message pinned here at
+    # SI-237 time - they are refused by name, still never
+    # reaching a cache write; the full shape set is pinned in
+    # the SI-318 section above.
     counter = WalkCounter()
     inst = make_instance(build_browser(counter))
     result = wire(inst, "get_browser_tree", {"category_type": 42})
@@ -691,15 +762,13 @@ def test_browser_cache_key_hashable_scalars_are_unchanged():
     result = wire(inst, "get_browser_tree", {"category_type": None})
     assert result["type"] is None and result["categories"] == []
 
-    for bad_path, message in (
-            (42, "'int' object has no attribute 'split'"),
-            (None, "'NoneType' object has no attribute 'split'")):
+    for bad_path in (42, None):
         inst = make_instance(build_browser(WalkCounter()))
         response = inst._process_command(
             {"type": "get_browser_items_at_path",
              "params": {"path": bad_path}})
         assert response["status"] == "error", response
-        assert response["message"] == message
+        assert response["message"] == "Invalid path: must be a string"
         _, read_cache = inst._browser_cache_state()
         assert len(read_cache) == 0
 
