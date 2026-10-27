@@ -5,11 +5,12 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, List, Optional, Union
 
-from .framing import FrameDecoder, FrameError, encode_frame
+from .framing import FrameDecoder, FrameError, MAX_FRAME_BYTES, encode_frame
 
 
 def _env_flag(name: str) -> bool:
@@ -119,6 +120,67 @@ _MODIFYING_COMMANDS = [
 _LONG_RUNNING_COMMAND_TIMEOUTS = {"create_audio_clip": 65.0}
 
 
+#: SI-345: ceiling for a v1 (unframed) response, mirroring the Remote
+#: Script's 16 MiB request cap (MAX_REQUEST_BYTES) - which is also the
+#: framing-v2 payload ceiling, so the bound is the same 16 MiB in both
+#: framings. The v1 receive loop accumulates chunks in memory; before
+#: SI-345 nothing bounded that accumulation, so a peer trickling (or
+#: flooding) a never-completing v1 response could grow it without
+#: limit as well as holding the exchange past its budget.
+MAX_V1_RESPONSE_BYTES = MAX_FRAME_BYTES
+
+
+def _apply_exchange_deadline(sock, deadline) -> None:
+    """Narrow *sock*'s timeout to the time left before *deadline*.
+
+    SI-345: the per-command budget is an absolute monotonic deadline
+    for the whole exchange (computed once by _send_command_locked,
+    following the dataset recorder's flush pattern), not a fresh
+    budget per recv() call. Before each receive, the socket timeout
+    is narrowed to the remaining time, so no single recv() can run
+    past the deadline and a peer that keeps delivering a byte inside
+    every window cannot extend the exchange beyond it. Raises
+    socket.timeout when the deadline has already passed, so callers
+    see exactly the exception a per-recv timeout would have produced
+    and the timeout classification in _send_command_locked is
+    unchanged. A None deadline leaves the socket untouched: direct
+    callers of the receive paths keep the pre-SI-345 contract (the
+    timeout the caller set stands, unmodified). The timeout is only
+    ever narrowed here, never widened back toward the full budget.
+    """
+    if deadline is None:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise socket.timeout("timed out (exchange deadline exceeded)")
+    sock.settimeout(remaining)
+
+
+def _resolve_exchange_deadline(sock, deadline):
+    """Return the exchange deadline in force for a receive path.
+
+    An explicit ``deadline`` (the production path: _send_command_locked
+    computes it once from the budget, before the send) wins. Without
+    one, a timeout already set on the socket is taken as the caller's
+    stated budget for the exchange and converted, here at receive
+    entry, into the same kind of absolute deadline - so the older
+    calling convention (settimeout, then call a receive path
+    directly) is bounded against a trickling peer too, instead of
+    silently keeping the per-recv semantics SI-345 removed. Sockets
+    with no timeout set (blocking mode) or no gettimeout (the test
+    fakes) yield None: no deadline, the pre-SI-345 contract.
+    """
+    if deadline is not None:
+        return deadline
+    gettimeout = getattr(sock, "gettimeout", None)
+    if not callable(gettimeout):
+        return None
+    current = gettimeout()
+    if current is None:
+        return None
+    return time.monotonic() + current
+
+
 @dataclass
 class AbletonConnection:
     host: str
@@ -200,31 +262,52 @@ class AbletonConnection:
                 logger.error(f"Error disconnecting from Ableton: {str(e)}")
 
 
-    def receive_full_response(self, sock, buffer_size=8192):
+    def receive_full_response(self, sock, buffer_size=8192, deadline=None):
         """Receive the complete v1 response, potentially in chunks.
 
         The caller sets the socket timeout (the per-command budget,
-        see _command_timeout) and this path never overrides it. Before
-        MCP-09 it forced ``sock.settimeout(15.0)`` here, silently
-        capping every v1 exchange - including create_audio_clip's 65 s
-        budget and execute_batch's summed budget. A socket.timeout
-        mid-receive stops the wait; partial bytes are then salvaged if
-        they parse as a complete response, otherwise an exception is
-        raised for the caller to classify.
+        see _command_timeout) before the exchange and, since SI-345,
+        passes the exchange's absolute monotonic ``deadline``: before
+        each recv() this path narrows the socket timeout to the time
+        remaining (see _apply_exchange_deadline), so the budget
+        governs the WHOLE exchange rather than each recv() in
+        isolation - a peer delivering a byte inside every per-recv
+        window can no longer hold the exchange past the budget. It
+        never widens the timeout and never substitutes a budget of
+        its own. Before MCP-09 it forced ``sock.settimeout(15.0)``
+        here, silently capping every v1 exchange - including
+        create_audio_clip's 65 s budget and execute_batch's summed
+        budget. A socket.timeout mid-receive stops the wait; partial
+        bytes are then salvaged if they parse as a complete response,
+        otherwise an exception is raised for the caller to classify.
+
+        SI-345 also bounds the accumulation itself: a response that
+        grows past MAX_V1_RESPONSE_BYTES (16 MiB, mirroring the
+        script's request cap) is refused instead of being buffered
+        without limit.
         """
         chunks = []
-        
+        total_bytes = 0
+        deadline = _resolve_exchange_deadline(sock, deadline)
+
         try:
             while True:
                 try:
+                    _apply_exchange_deadline(sock, deadline)
                     chunk = sock.recv(buffer_size)
                     if not chunk:
                         if not chunks:
                             raise Exception("Connection closed before receiving any data")
                         break
-                    
+
                     chunks.append(chunk)
-                    
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_V1_RESPONSE_BYTES:
+                        raise Exception(
+                            "Response exceeded %d bytes without a "
+                            "complete JSON response"
+                            % MAX_V1_RESPONSE_BYTES)
+
                     # Check if we've received a complete JSON object
                     try:
                         data = b''.join(chunks)
@@ -273,7 +356,7 @@ class AbletonConnection:
         framing = result.get("agent0_framing") if isinstance(result, dict) else None
         self._framing_v2 = isinstance(framing, list) and "v2" in framing
 
-    def _receive_framed_response(self, sock, buffer_size=8192) -> bytes:
+    def _receive_framed_response(self, sock, buffer_size=8192, deadline=None) -> bytes:
         """Receive exactly one framing-v2 response frame (MCP-03).
 
         Chunks feed an incremental FrameDecoder and the completed
@@ -283,15 +366,20 @@ class AbletonConnection:
         an invalid/oversized frame, and on any trailing bytes: the
         script answers one request with exactly one frame, so extra
         data means the stream is desynchronised and the caller must
-        drop the connection. Like receive_full_response it does NOT
-        touch the socket timeout - the caller sets the per-command
-        budget before the exchange (MCP-09), so both paths honour it.
+        drop the connection. The caller sets the per-command budget
+        before the exchange (MCP-09) and, since SI-345, passes the
+        exchange's absolute monotonic ``deadline``: like
+        receive_full_response, this path narrows the socket timeout
+        to the time remaining before each recv() (never widening it),
+        so the budget governs the whole exchange on this path too.
         """
         decoder = FrameDecoder()
+        deadline = _resolve_exchange_deadline(sock, deadline)
         while True:
             payload = decoder.next_frame()
             if payload is not None:
                 break
+            _apply_exchange_deadline(sock, deadline)
             chunk = sock.recv(buffer_size)
             if not chunk:
                 if decoder.pending_bytes:
@@ -481,6 +569,20 @@ class AbletonConnection:
             # receive path then overrode it with a hard 15 s anyway.
             self.sock.settimeout(timeout)
 
+            # SI-345: the budget is also converted, here, into an
+            # absolute monotonic deadline for the exchange (the
+            # dataset recorder's flush pattern: deadline computed
+            # once, honoured per iteration). settimeout alone applies
+            # per recv() call, so a peer delivering at least one byte
+            # inside every window could hold either receive path past
+            # the budget indefinitely and the timeout classification
+            # below never fired (SI-344 D1). The receive paths narrow
+            # the socket timeout to the time remaining before each
+            # recv(), so a response not complete by this deadline
+            # raises the same socket.timeout this budget always
+            # produced for a silent peer.
+            deadline = time.monotonic() + timeout
+
             # Send the command (serialised and, under framing v2,
             # framed before the try - SI-74). Under framing v2 the
             # same JSON bytes travel length-prefixed; the script
@@ -498,9 +600,11 @@ class AbletonConnection:
             # definitive answers (error envelope, echo mismatch).
             try:
                 if self._framing_v2:
-                    response_data = self._receive_framed_response(self.sock)
+                    response_data = self._receive_framed_response(
+                        self.sock, deadline=deadline)
                 else:
-                    response_data = self.receive_full_response(self.sock)
+                    response_data = self.receive_full_response(
+                        self.sock, deadline=deadline)
             except socket.timeout:
                 raise OutcomeUnknownError(
                     "Timeout waiting for Ableton response to %r "

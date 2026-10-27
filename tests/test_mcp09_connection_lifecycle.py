@@ -99,6 +99,18 @@ def _conn(sock=None, framing_v2=False):
     return conn
 
 
+def _assert_budget_timeouts(sock, budget):
+    # SI-345: the first timeout set for an exchange is the budget
+    # itself (set by _send_command_locked before the send); the
+    # receive paths then only narrow it toward the exchange's
+    # absolute deadline, so every entry is positive and none exceeds
+    # the budget. Before SI-345 exactly one timeout was set; the pin
+    # now asserts the budget is the ceiling, not the call count.
+    assert sock.timeouts
+    assert sock.timeouts[0] == budget
+    assert all(0 < t <= budget for t in sock.timeouts)
+
+
 def _v1_payload(result):
     return json.dumps({"status": "success", "result": result}).encode()
 
@@ -147,8 +159,8 @@ def test_v1_long_command_survives_a_gap_over_15s():
     conn = _conn(sock)
     result = conn.send_command("create_audio_clip", {"track_index": 0})
     assert result == {"clip_name": "x"}
-    # Exactly one timeout is set for the whole exchange: the budget.
-    assert sock.timeouts == [65.0]
+    # The budget is the first (and largest) timeout of the exchange.
+    _assert_budget_timeouts(sock, 65.0)
 
 
 def test_v2_long_command_survives_a_gap_over_15s():
@@ -156,7 +168,7 @@ def test_v2_long_command_survives_a_gap_over_15s():
     conn = _conn(sock, framing_v2=True)
     result = conn.send_command("create_audio_clip", {"track_index": 0})
     assert result == {"clip_name": "x"}
-    assert sock.timeouts == [65.0]
+    _assert_budget_timeouts(sock, 65.0)
 
 
 def test_v1_read_command_gap_beyond_its_budget_is_outcome_unknown():
@@ -166,7 +178,7 @@ def test_v1_read_command_gap_beyond_its_budget_is_outcome_unknown():
         conn.send_command("get_session_info")
     assert excinfo.value.command_type == "get_session_info"
     assert "outcome unknown" in str(excinfo.value)
-    assert sock.timeouts == [10.0]
+    _assert_budget_timeouts(sock, 10.0)
     assert sock.closed is True
     assert conn.sock is None
 
@@ -190,7 +202,7 @@ def test_batch_timeout_is_the_sum_and_is_honoured_on_v1():
     result = conn.send_batch([{"type": "set_tempo", "params": {"tempo": 1}},
                               {"type": "get_session_info"}])
     assert result == batch_result
-    assert sock.timeouts == [25.0]  # 15 + 10, and > the old 15 s cap
+    _assert_budget_timeouts(sock, 25.0)  # 15 + 10, and > the old 15 s cap
 
 
 def test_batch_post_send_failure_is_outcome_unknown_at_batch_level():
@@ -758,3 +770,149 @@ def test_v2_exactly_max_size_request_is_sent_and_succeeds():
     assert len(sock.sent[0]) == MAX_FRAME_BYTES + 4  # + frame header
     assert sock.closed is False
     assert conn.sock is sock
+
+
+# ------------------------------------------- SI-345 exchange deadline
+#
+# SI-344 D1: the per-command budget was documented in three places as
+# governing the WHOLE exchange, but _send_command_locked implemented
+# it as a single sock.settimeout(timeout), which Python applies per
+# recv() call. A peer delivering at least one byte inside every
+# per-recv window therefore kept both receive paths waiting
+# indefinitely past the budget (SI-344 probe, real socketpairs at
+# a3217d2: under a 0.5 s budget a 41-byte v1 response trickled at
+# 1 byte / 0.25 s returned after 10.13 s, success), and the timeout ->
+# OutcomeUnknownError classification never fired. The v1 loop also
+# accumulated chunks with no size cap.
+#
+# The fix converts the budget into an absolute monotonic deadline in
+# _send_command_locked (computed once, the dataset recorder's flush
+# pattern) and passes it to both receive paths, which narrow the
+# socket timeout to the time remaining before each recv(). The pins
+# below run the REAL production path - send_command over a real
+# socketpair against a trickling peer, with the budget shortened
+# through the same instance-patched _command_timeout seam the
+# RealPeer tests above use - at sub-second budgets, so no test waits
+# anywhere near the historical 10 s+ escape. Silence controls pin
+# that a silent peer still times out at exactly the budget, and the
+# within-budget trickle control pins that a slow-but-in-budget peer
+# is byte-identical to base.
+
+import MCP_Server.server as _server345
+
+
+class TricklePeer:
+    """One end of a real socketpair; trickles its response.
+
+    Reads the client's request first, then sends ``payload`` one byte
+    every ``interval`` seconds: a peer that always delivers inside
+    any per-recv window (so a per-recv timeout never fires, at base
+    or head), but whose complete response takes far longer than the
+    test budget. ``payload=None`` sends nothing at all and holds the
+    socket open - the silence control.
+    """
+
+    def __init__(self, payload, interval=0.1):
+        self.client, self.peer = socket.socketpair()
+        self._payload = payload
+        self._interval = interval
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        try:
+            self.peer.settimeout(5.0)
+            self.peer.recv(65536)
+            if self._payload is None:
+                time.sleep(3.0)
+                return
+            for i in range(len(self._payload)):
+                self.peer.sendall(self._payload[i:i + 1])
+                if self._interval:
+                    time.sleep(self._interval)
+        except Exception:
+            pass  # the client may already be gone (deadline tests)
+
+    def start(self):
+        self.thread.start()
+        return self.client
+
+
+def _budget_conn(client, budget, framing_v2=False):
+    conn = _conn(client, framing_v2=framing_v2)
+    conn._command_timeout = lambda command_type, params=None: budget
+    return conn
+
+
+def test_si345_v1_trickle_past_budget_is_outcome_unknown():
+    # 41 bytes at 1 byte / 0.1 s would take ~4.1 s to complete - over
+    # 8x the 0.5 s budget - yet every byte arrives well inside a
+    # 0.5 s per-recv window, so at base this returned successfully.
+    peer = TricklePeer(_v1_payload({"tempo": 120.0}), interval=0.1)
+    conn = _budget_conn(peer.start(), 0.5)
+    started = time.perf_counter()
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    elapsed = time.perf_counter() - started
+    assert excinfo.value.command_type == "get_session_info"
+    # Cut at the budget, not at the trickle's ~4.1 s completion.
+    assert 0.4 <= elapsed < 2.0
+    assert conn.sock is None
+
+
+def test_si345_v1_silence_still_times_out_at_the_budget():
+    peer = TricklePeer(None)
+    conn = _budget_conn(peer.start(), 0.5)
+    started = time.perf_counter()
+    with pytest.raises(OutcomeUnknownError):
+        conn.send_command("get_session_info")
+    elapsed = time.perf_counter() - started
+    # Unchanged from base: a silent peer is refused at the budget.
+    assert 0.4 <= elapsed < 2.0
+    assert conn.sock is None
+
+
+def test_si345_v1_trickle_within_budget_still_completes():
+    # Control (passes at base and head): a slow peer whose response
+    # completes inside the budget succeeds byte-identically.
+    peer = TricklePeer(_v1_payload({"tempo": 120.0}), interval=0.01)
+    conn = _budget_conn(peer.start(), 5.0)
+    started = time.perf_counter()
+    assert conn.send_command("get_session_info") == {"tempo": 120.0}
+    assert time.perf_counter() - started >= 0.3  # it really trickled
+    assert conn.sock is not None
+
+
+def test_si345_v1_response_size_cap_refuses_oversize(monkeypatch):
+    # The v1 accumulation is bounded at MAX_V1_RESPONSE_BYTES,
+    # mirroring the script's 16 MiB request cap; the seam is the
+    # monkeypatched constant (the SI-72 script-side precedent), the
+    # path exercised is the real send_command receive loop.
+    monkeypatch.setattr(_server345, "MAX_V1_RESPONSE_BYTES", 64)
+    payload = b'{"status": "success", "result": {"blob": "' + b"x" * 200
+    peer = TricklePeer(payload, interval=0)
+    conn = _budget_conn(peer.start(), 5.0)
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    assert "Response exceeded 64 bytes" in str(excinfo.value)
+    assert conn.sock is None
+
+
+def test_si345_v1_response_size_cap_direct_receive_path(monkeypatch):
+    monkeypatch.setattr(_server345, "MAX_V1_RESPONSE_BYTES", 64)
+    client, peer_sock = socket.socketpair()
+    payload = b'{"status": "success", "result": {"blob": "' + b"x" * 200
+
+    def _serve():
+        try:
+            peer_sock.sendall(payload)
+        except Exception:
+            pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+    client.settimeout(5.0)
+    conn = _conn()
+    with pytest.raises(Exception) as excinfo:
+        conn.receive_full_response(client)
+    assert "Response exceeded 64 bytes" in str(excinfo.value)
+    client.close()
+    peer_sock.close()

@@ -752,3 +752,112 @@ def test_v1_moderately_padded_request_still_succeeds_over_real_socket(
         assert peer.requests == 1
     finally:
         peer.close()
+
+
+# ------------------------------------------- SI-345 exchange deadline
+#
+# The framed (v2) half of SI-344 D1: _receive_framed_response shared
+# the v1 path's per-recv() budget defect - under a 0.5 s budget a
+# 45-byte framed response trickled at 1 byte / 0.25 s returned after
+# 11.13 s at base (SI-344 probe344b), success, because each byte
+# reset the per-recv timeout. The fix is the same absolute monotonic
+# deadline the v1 pins in test_mcp09_connection_lifecycle.py cover:
+# _send_command_locked computes it once from the budget and both
+# receive paths narrow the socket timeout to the remainder before
+# each recv(). These pins run the real production path (send_command
+# on a v2-negotiated connection over a real socketpair, budget
+# shortened via the instance-patched _command_timeout seam) at
+# sub-second budgets. The v1 trickle/silence/cap pins live in the
+# mcp09 suite.
+
+import time
+
+from MCP_Server.server import AbletonConnection, OutcomeUnknownError
+
+
+class _TricklePeerV2:
+    """One end of a real socketpair; trickles a framed response.
+
+    Reads the client's (framed) request first, then sends the framed
+    payload one byte every ``interval`` seconds - always inside any
+    per-recv window, but far past the test budget in total.
+    ``payload=None`` sends nothing and holds the socket open (the
+    silence control).
+    """
+
+    def __init__(self, payload, interval=0.1):
+        self.client, self.peer = socket.socketpair()
+        self._payload = payload
+        self._interval = interval
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        try:
+            self.peer.settimeout(5.0)
+            self.peer.recv(65536)
+            if self._payload is None:
+                time.sleep(3.0)
+                return
+            for i in range(len(self._payload)):
+                self.peer.sendall(self._payload[i:i + 1])
+                if self._interval:
+                    time.sleep(self._interval)
+        except Exception:
+            pass  # the client may already be gone (deadline tests)
+
+    def start(self):
+        self.thread.start()
+        return self.client
+
+
+def _v2_trickle_conn(client, budget):
+    conn = AbletonConnection("127.0.0.1", 9877)
+    conn.sock = client
+    conn._framing_v2 = True  # as a v2 handshake would have set it
+    conn._command_timeout = lambda command_type, params=None: budget
+    return conn
+
+
+def _framed_result(result):
+    return encode_frame(json.dumps(
+        {"status": "success", "result": result,
+         "request_id": 1}).encode())
+
+
+def test_si345_v2_trickle_past_budget_is_outcome_unknown():
+    # The framed payload is ~50 bytes: at 1 byte / 0.1 s it completes
+    # in ~5 s, 10x the 0.5 s budget, without ever tripping a per-recv
+    # timeout. At base send_command returned the result successfully.
+    peer = _TricklePeerV2(_framed_result({"tempo": 120.0}), interval=0.1)
+    conn = _v2_trickle_conn(peer.start(), 0.5)
+    started = time.perf_counter()
+    with pytest.raises(OutcomeUnknownError) as excinfo:
+        conn.send_command("get_session_info")
+    elapsed = time.perf_counter() - started
+    assert excinfo.value.command_type == "get_session_info"
+    assert 0.4 <= elapsed < 2.0
+    assert conn.sock is None
+    assert conn._framing_v2 is False
+
+
+def test_si345_v2_silence_still_times_out_at_the_budget():
+    peer = _TricklePeerV2(None)
+    conn = _v2_trickle_conn(peer.start(), 0.5)
+    started = time.perf_counter()
+    with pytest.raises(OutcomeUnknownError):
+        conn.send_command("get_session_info")
+    elapsed = time.perf_counter() - started
+    # Unchanged from base: a silent peer is refused at the budget.
+    assert 0.4 <= elapsed < 2.0
+    assert conn.sock is None
+
+
+def test_si345_v2_trickle_within_budget_still_completes():
+    # Control (passes at base and head): a slow framed response that
+    # completes inside the budget succeeds byte-identically.
+    peer = _TricklePeerV2(_framed_result({"tempo": 120.0}), interval=0.01)
+    conn = _v2_trickle_conn(peer.start(), 5.0)
+    started = time.perf_counter()
+    assert conn.send_command("get_session_info") == {"tempo": 120.0}
+    assert time.perf_counter() - started >= 0.3  # it really trickled
+    assert conn.sock is not None
