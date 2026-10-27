@@ -2554,7 +2554,7 @@ class AbletonMCP(ControlSurface):
         if not isinstance(params, dict):
             raise ValueError("search_browser requires an object of params")
         query = params.get("query")
-        if not isinstance(query, (bytes, str)) or not query.strip():
+        if not isinstance(query, str) or not query.strip():
             raise ValueError(
                 "search_browser requires a non-empty 'query' string")
         limit = _coerce_page_int(params.get("limit"),

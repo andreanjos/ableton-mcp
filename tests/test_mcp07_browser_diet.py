@@ -53,6 +53,17 @@ property counts every hierarchy descent:
   hashable-scalar control below is updated for this handler's
   path only - category_type and uri scalars keep their exact
   legacy behaviour;
+* search_browser refuses a non-empty bytes query by name
+  (SI-319): the query guard admitted bytes alongside str, so
+  b"kit" passed the guard (strip/lower/cache key all survive)
+  and died inside match collection at needle in name.lower()
+  with the raw "'in <string>' requires string as left
+  operand, not bytes", where every other non-string query is
+  refused as "search_browser requires a non-empty 'query'
+  string"; the guard now admits str only, so a bytes query
+  takes that same named refusal before any walk or cache
+  write - empty bytes and bytearray queries already refused
+  that way and are unchanged;
 * search_browser matches by name or URI, case-insensitively, in
   browser order, pages from one cached walk, and validates its
   query; the tool surface sends clean wire params and an old script
@@ -1002,6 +1013,52 @@ def test_search_requires_a_nonempty_query():
             {"type": "search_browser", "params": params})
         assert response["status"] == "error", params
         assert "requires a non-empty 'query'" in response["message"]
+
+
+def test_search_bytes_query_is_refused_by_name():
+    # SI-317 D2, probed first-hand at base: the query guard was
+    # isinstance(query, (bytes, str)), so a non-empty bytes
+    # query passed it - strip, lower and the cache key all
+    # survive on bytes - and died inside
+    # _collect_browser_matches at needle in name.lower() with
+    # the raw "'in <string>' requires string as left operand,
+    # not bytes", where every other non-string query (int,
+    # list, dict, float, None, bytearray) is refused by name.
+    # The guard now admits str only. Each form runs on a fresh
+    # instance, plain and with paging values sent: the refusal
+    # is the exact named message, no walk happens, no cache
+    # entry is written, and a valid search on the same instance
+    # still succeeds afterwards.
+    for params in ({"query": b"kit"},
+                   {"query": b"kit", "limit": 5},
+                   {"query": b"kit", "offset": 0}):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        response = inst._process_command(
+            {"type": "search_browser", "params": params})
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "search_browser requires a non-empty 'query' string")
+        assert response["result"] == {}
+        assert counter.walks == 0
+        uri_cache, read_cache = inst._browser_cache_state()
+        assert len(uri_cache) == 0 and len(read_cache) == 0
+        result = wire(inst, "search_browser", {"query": "kit"})
+        assert result["total"] == 11
+    # Controls, unchanged at base and head: empty-after-strip
+    # bytes and a bytearray query already took the same named
+    # refusal before the fix (the guard fired on strip for the
+    # former, on the type check for the latter).
+    for query in (b"", b" ", bytearray(b"kit")):
+        counter = WalkCounter()
+        inst = make_instance(build_browser(counter))
+        response = inst._process_command(
+            {"type": "search_browser", "params": {"query": query}})
+        assert response["status"] == "error", response
+        assert response["message"] == (
+            "search_browser requires a non-empty 'query' string")
+        assert response["result"] == {}
+        assert counter.walks == 0
 
 
 def test_search_works_inside_execute_batch():
