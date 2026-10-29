@@ -70,6 +70,15 @@ Regenerating the goldens (only ever as a deliberate, reviewed act -
 e.g. after an intentional catalog change): re-run the probes that
 produced GOLDEN_JSON below against the new tree, paste the result,
 and let the diff be the review surface.
+
+MCP-15 delta (2026-10-29): the tool catalog was extended ADDITIVELY
+with the six suno_* bridge tools (suno_status, suno_generate,
+suno_generate_to_live, suno_library_to_live, suno_cover_clip,
+suno_extend_clip) - 41 -> 47 entries. Every pre-existing entry is
+byte-identical to the 1.7.10 record; the only other change in this
+file is the catalog count pin. The wire command table, handshake,
+envelopes, classification surface and installer goldens are
+untouched: the Suno bridge adds no Live wire commands.
 """
 
 import ast
@@ -1661,6 +1670,339 @@ GOLDEN_JSON = r"""{
    },
    "return": "str"
   },
+  "suno_cover_clip": {
+   "parameters": {
+    "properties": {
+     "allow_download_credit": {
+      "default": false,
+      "title": "Allow Download Credit",
+      "type": "boolean"
+     },
+     "clip_count": {
+      "default": 1,
+      "title": "Clip Count",
+      "type": "integer"
+     },
+     "clip_index": {
+      "title": "Clip Index",
+      "type": "integer"
+     },
+     "file_path": {
+      "title": "File Path",
+      "type": "string"
+     },
+     "keep_vocals": {
+      "default": false,
+      "title": "Keep Vocals",
+      "type": "boolean"
+     },
+     "lyrics": {
+      "default": "",
+      "title": "Lyrics",
+      "type": "string"
+     },
+     "match_tempo": {
+      "default": false,
+      "title": "Match Tempo",
+      "type": "boolean"
+     },
+     "style": {
+      "default": "",
+      "title": "Style",
+      "type": "string"
+     },
+     "title": {
+      "default": "",
+      "title": "Title",
+      "type": "string"
+     },
+     "track_index": {
+      "title": "Track Index",
+      "type": "integer"
+     },
+     "user_prompt": {
+      "default": "",
+      "title": "User Prompt",
+      "type": "string"
+     },
+     "voice_id": {
+      "default": "",
+      "title": "Voice Id",
+      "type": "string"
+     },
+     "wait_budget_seconds": {
+      "default": 600,
+      "title": "Wait Budget Seconds",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "track_index",
+     "clip_index",
+     "file_path"
+    ],
+    "title": "suno_cover_clipArguments",
+    "type": "object"
+   },
+   "return": "str"
+  },
+  "suno_extend_clip": {
+   "parameters": {
+    "properties": {
+     "allow_download_credit": {
+      "default": false,
+      "title": "Allow Download Credit",
+      "type": "boolean"
+     },
+     "clip_count": {
+      "default": 1,
+      "title": "Clip Count",
+      "type": "integer"
+     },
+     "clip_index": {
+      "title": "Clip Index",
+      "type": "integer"
+     },
+     "continue_at": {
+      "title": "Continue At",
+      "type": "number"
+     },
+     "file_path": {
+      "title": "File Path",
+      "type": "string"
+     },
+     "lyrics": {
+      "default": "",
+      "title": "Lyrics",
+      "type": "string"
+     },
+     "match_tempo": {
+      "default": false,
+      "title": "Match Tempo",
+      "type": "boolean"
+     },
+     "style": {
+      "default": "",
+      "title": "Style",
+      "type": "string"
+     },
+     "title": {
+      "default": "",
+      "title": "Title",
+      "type": "string"
+     },
+     "track_index": {
+      "title": "Track Index",
+      "type": "integer"
+     },
+     "user_prompt": {
+      "default": "",
+      "title": "User Prompt",
+      "type": "string"
+     },
+     "wait_budget_seconds": {
+      "default": 600,
+      "title": "Wait Budget Seconds",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "track_index",
+     "clip_index",
+     "file_path",
+     "continue_at"
+    ],
+    "title": "suno_extend_clipArguments",
+    "type": "object"
+   },
+   "return": "str"
+  },
+  "suno_generate": {
+   "parameters": {
+    "properties": {
+     "clip_count": {
+      "default": 1,
+      "title": "Clip Count",
+      "type": "integer"
+     },
+     "description": {
+      "default": "",
+      "title": "Description",
+      "type": "string"
+     },
+     "duration": {
+      "default": 0,
+      "title": "Duration",
+      "type": "integer"
+     },
+     "duration_strict": {
+      "default": false,
+      "title": "Duration Strict",
+      "type": "boolean"
+     },
+     "instrumental": {
+      "default": false,
+      "title": "Instrumental",
+      "type": "boolean"
+     },
+     "lyrics": {
+      "default": "",
+      "title": "Lyrics",
+      "type": "string"
+     },
+     "model": {
+      "default": "",
+      "title": "Model",
+      "type": "string"
+     },
+     "style": {
+      "default": "",
+      "title": "Style",
+      "type": "string"
+     },
+     "title": {
+      "default": "",
+      "title": "Title",
+      "type": "string"
+     },
+     "user_prompt": {
+      "default": "",
+      "title": "User Prompt",
+      "type": "string"
+     },
+     "wait_budget_seconds": {
+      "default": 600,
+      "title": "Wait Budget Seconds",
+      "type": "integer"
+     }
+    },
+    "title": "suno_generateArguments",
+    "type": "object"
+   },
+   "return": "str"
+  },
+  "suno_generate_to_live": {
+   "parameters": {
+    "properties": {
+     "allow_download_credit": {
+      "default": false,
+      "title": "Allow Download Credit",
+      "type": "boolean"
+     },
+     "clip_count": {
+      "default": 1,
+      "title": "Clip Count",
+      "type": "integer"
+     },
+     "description": {
+      "default": "",
+      "title": "Description",
+      "type": "string"
+     },
+     "duration": {
+      "default": 0,
+      "title": "Duration",
+      "type": "integer"
+     },
+     "duration_strict": {
+      "default": false,
+      "title": "Duration Strict",
+      "type": "boolean"
+     },
+     "instrumental": {
+      "default": false,
+      "title": "Instrumental",
+      "type": "boolean"
+     },
+     "lyrics": {
+      "default": "",
+      "title": "Lyrics",
+      "type": "string"
+     },
+     "match_tempo": {
+      "default": false,
+      "title": "Match Tempo",
+      "type": "boolean"
+     },
+     "model": {
+      "default": "",
+      "title": "Model",
+      "type": "string"
+     },
+     "style": {
+      "default": "",
+      "title": "Style",
+      "type": "string"
+     },
+     "title": {
+      "default": "",
+      "title": "Title",
+      "type": "string"
+     },
+     "user_prompt": {
+      "default": "",
+      "title": "User Prompt",
+      "type": "string"
+     },
+     "wait_budget_seconds": {
+      "default": 600,
+      "title": "Wait Budget Seconds",
+      "type": "integer"
+     }
+    },
+    "title": "suno_generate_to_liveArguments",
+    "type": "object"
+   },
+   "return": "str"
+  },
+  "suno_library_to_live": {
+   "parameters": {
+    "properties": {
+     "allow_download_credit": {
+      "default": false,
+      "title": "Allow Download Credit",
+      "type": "boolean"
+     },
+     "clip_id": {
+      "default": "",
+      "title": "Clip Id",
+      "type": "string"
+     },
+     "match_tempo": {
+      "default": false,
+      "title": "Match Tempo",
+      "type": "boolean"
+     },
+     "query": {
+      "default": "",
+      "title": "Query",
+      "type": "string"
+     },
+     "user_prompt": {
+      "default": "",
+      "title": "User Prompt",
+      "type": "string"
+     }
+    },
+    "title": "suno_library_to_liveArguments",
+    "type": "object"
+   },
+   "return": "str"
+  },
+  "suno_status": {
+   "parameters": {
+    "properties": {
+     "user_prompt": {
+      "default": "",
+      "title": "User Prompt",
+      "type": "string"
+     }
+    },
+    "title": "suno_statusArguments",
+    "type": "object"
+   },
+   "return": "str"
+  },
   "switch_to_arrangement_view": {
    "parameters": {
     "properties": {
@@ -1744,7 +2086,9 @@ def test_tool_catalog_matches_frozen_snapshot():
 
 
 def test_tool_catalog_count_and_return_contract():
-    assert len(FROZEN_TOOLS) == 41
+    # 41 frozen base tools + the 6 MCP-15 suno_* tools, added by the
+    # MCP-15 golden extension (see the module docstring).
+    assert len(FROZEN_TOOLS) == 47
     assert {entry["return"] for entry in FROZEN_TOOLS.values()} == {"str"}
 
 

@@ -2339,6 +2339,446 @@ def record_audition(
 
 
 
+# ------------------------------------------------------------- MCP-15
+# Suno bridge tools. The logic lives in MCP_Server.suno_bridge, the
+# MCP client in MCP_Server.suno_client, and the fork's own Suno OAuth
+# grant in MCP_Server.suno_auth; everything is imported lazily inside
+# _get_suno_bridge so importing this module (and the lean profile's
+# no-side-plane rule) is untouched. No Suno call happens at import
+# time, and no Live command is sent by the read-only tools.
+
+
+class _SunoLivePlacer:
+    """The Live edge of the Suno bridge: place a downloaded file on a
+    fresh audio track and prove it landed by reading the track back.
+
+    Placement is verified, never assumed: if slot 0 of the new track
+    does not read back with a clip, the placement raises.
+    """
+
+    def __init__(self, connection_factory):
+        self._connection_factory = connection_factory
+
+    def _conn(self):
+        return self._connection_factory()
+
+    def get_clip_slot(self, track_index: int, clip_index: int):
+        result = self._conn().send_command(
+            "get_track_info", {"track_index": track_index}
+        )
+        for slot in result.get("clip_slots") or []:
+            if slot.get("index") == clip_index:
+                return {
+                    "has_clip": bool(slot.get("has_clip")),
+                    "clip": slot.get("clip"),
+                }
+        return None
+
+    def place_audio_file(self, path: str, track_name: str,
+                         tempo_bpm: float = None) -> dict:
+        conn = self._conn()
+        before = conn.send_command("get_session_info")
+        created = conn.send_command("create_audio_track", {"index": -1})
+        track_index = created.get("index")
+        if track_index is None:
+            tracks = before.get("tracks") or []
+            track_index = before.get("track_count", len(tracks))
+        conn.send_command(
+            "set_track_name",
+            {"track_index": track_index, "name": track_name},
+        )
+        clip_result = conn.send_command(
+            "create_audio_clip",
+            {
+                "track_index": track_index,
+                "clip_index": 0,
+                "path": str(path),
+            },
+        )
+        tempo_set = None
+        if tempo_bpm:
+            conn.send_command("set_tempo", {"tempo": float(tempo_bpm)})
+            tempo_set = float(tempo_bpm)
+        verify = conn.send_command(
+            "get_track_info", {"track_index": track_index}
+        )
+        placed_clip = None
+        for slot in verify.get("clip_slots") or []:
+            if slot.get("index") == 0:
+                placed_clip = slot.get("clip")
+        if not placed_clip:
+            raise Exception(
+                "Placement verification failed: no clip read back in "
+                "slot 0 of track %s after create_audio_clip"
+                % (track_index,)
+            )
+        return {
+            "track_index": track_index,
+            "clip_index": 0,
+            "track_name": track_name,
+            "clip": placed_clip,
+            "clip_result": clip_result,
+            "tempo_set": tempo_set,
+        }
+
+
+_suno_bridge = None
+
+
+def _get_suno_bridge():
+    """Build the bridge on first use (never at import time)."""
+    global _suno_bridge
+    if _suno_bridge is None:
+        from pathlib import Path
+
+        from .suno_auth import build_client
+        from .suno_bridge import SunoBridge
+
+        client, _oauth = build_client()
+        download_dir = os.environ.get(
+            "ABLETON_MCP_SUNO_DOWNLOAD_DIR"
+        ) or str(Path.home() / "Downloads" / "AbletonMCP-Suno")
+        _suno_bridge = SunoBridge(
+            client,
+            _SunoLivePlacer(get_ableton_connection),
+            download_dir,
+        )
+    return _suno_bridge
+
+
+def _suno_text(value: str):
+    """Tool arguments arrive as strings; empty means 'not given'."""
+    return value if value else None
+
+
+@mcp.tool()
+@telemetry_tool("suno_status")
+@trajectory_tool("suno_status", modifying=False)
+def suno_status(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Read the Suno account and usage for the bridge's own sign-in.
+
+    Returns the signed-in profile, the plan, the remaining credits
+    and the allowed models/features. Read-only: spends nothing. This
+    is the pre-generation guard surface - suno_generate checks the
+    same usage before creating anything.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        return _dump_tool_result(_get_suno_bridge().status())
+    except Exception as e:
+        logger.error(f"Error reading Suno status: {str(e)}")
+        return f"Error reading Suno status: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("suno_generate")
+@trajectory_tool("suno_generate")
+def suno_generate(
+    ctx: Context,
+    description: str = "",
+    lyrics: str = "",
+    style: str = "",
+    title: str = "",
+    instrumental: bool = False,
+    duration: int = 0,
+    duration_strict: bool = False,
+    model: str = "",
+    clip_count: int = 1,
+    wait_budget_seconds: int = 600,
+    user_prompt: str = "",
+) -> str:
+    """
+    Generate audio on Suno and wait for it to finish (no Live placement).
+
+    Simple mode: pass description alone. Custom mode: pass lyrics,
+    usually with style and title. The modes cannot be mixed. Costs
+    Suno credits: the account usage is checked first and the call is
+    refused when the remaining credits cannot cover clip_count.
+    clip_count is pinned explicitly (Suno defaults an MCP sign-in to
+    2); it must be 1 or 2. duration is a target length in seconds
+    (15-360, 0 = model chooses); duration_strict is sent explicitly
+    whenever a duration is given. If the wait budget runs out first,
+    the result reports status "pending" with the live clip ids -
+    nothing is re-submitted.
+
+    Parameters:
+    - description: Natural-language song description (Simple mode)
+    - lyrics: Lyrics to sing (Custom mode)
+    - style: Style tags (Custom mode)
+    - title: Song title (Custom mode)
+    - instrumental: Force a vocal-free generation
+    - duration: Target length in seconds, 0 = model chooses
+    - duration_strict: Hard-cap the clip at duration
+    - model: Suno model label, empty = plan default
+    - clip_count: Songs per generation, 1 or 2 (default 1)
+    - wait_budget_seconds: Total seconds to wait for completion
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _get_suno_bridge().generate(
+            description=_suno_text(description),
+            lyrics=_suno_text(lyrics),
+            style=_suno_text(style),
+            title=_suno_text(title),
+            instrumental=instrumental,
+            duration=duration if duration else None,
+            duration_strict=duration_strict,
+            model=_suno_text(model),
+            clip_count=clip_count,
+            wait_budget_seconds=wait_budget_seconds,
+        )
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error generating on Suno: {str(e)}")
+        return f"Error generating on Suno: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("suno_generate_to_live")
+@trajectory_tool("suno_generate_to_live")
+def suno_generate_to_live(
+    ctx: Context,
+    description: str = "",
+    lyrics: str = "",
+    style: str = "",
+    title: str = "",
+    instrumental: bool = False,
+    duration: int = 0,
+    duration_strict: bool = False,
+    model: str = "",
+    clip_count: int = 1,
+    match_tempo: bool = False,
+    allow_download_credit: bool = False,
+    wait_budget_seconds: int = 600,
+    user_prompt: str = "",
+) -> str:
+    """
+    Generate on Suno, download the WAV, and place it in Live.
+
+    The full generate flow of suno_generate, then: Suno's audio
+    analysis is read best-effort (bpm/key when it is ready), the WAV
+    is downloaded, and the file is placed on a new audio track named
+    "<title> [suno:<clip_id>]", verified by reading the track back.
+    A sidecar .suno.json mapping file is written next to the WAV.
+    The download follows Suno's credit rule: if it needs a download
+    credit and allow_download_credit is False, the tool stops and
+    reports "requires_download_credit" instead of spending it.
+    match_tempo sets Live's tempo to the analysed bpm - only when an
+    analysis bpm was actually measured. With clip_count 2 only the
+    first finished song is placed; both ids are in the result.
+
+    Parameters:
+    - description: Natural-language song description (Simple mode)
+    - lyrics: Lyrics to sing (Custom mode)
+    - style: Style tags (Custom mode)
+    - title: Song title (Custom mode)
+    - instrumental: Force a vocal-free generation
+    - duration: Target length in seconds, 0 = model chooses
+    - duration_strict: Hard-cap the clip at duration
+    - model: Suno model label, empty = plan default
+    - clip_count: Songs per generation, 1 or 2 (default 1)
+    - match_tempo: Set Live's tempo to the analysed bpm
+    - allow_download_credit: Approve spending a download credit if required
+    - wait_budget_seconds: Total seconds to wait for completion
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _get_suno_bridge().generate_to_live(
+            description=_suno_text(description),
+            lyrics=_suno_text(lyrics),
+            style=_suno_text(style),
+            title=_suno_text(title),
+            instrumental=instrumental,
+            duration=duration if duration else None,
+            duration_strict=duration_strict,
+            model=_suno_text(model),
+            clip_count=clip_count,
+            match_tempo=match_tempo,
+            allow_download_credit=allow_download_credit,
+            wait_budget_seconds=wait_budget_seconds,
+        )
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error generating to Live from Suno: {str(e)}")
+        return f"Error generating to Live from Suno: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("suno_library_to_live")
+@trajectory_tool("suno_library_to_live")
+def suno_library_to_live(
+    ctx: Context,
+    clip_id: str = "",
+    query: str = "",
+    match_tempo: bool = False,
+    allow_download_credit: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """
+    Place an existing song from the Suno library into Live.
+
+    No generation cost. Pass clip_id for an exact song, or query to
+    take the newest library song whose title/style matches, or
+    neither for the newest library song. Download, analysis and
+    placement follow suno_generate_to_live, including the download
+    credit rule (allow_download_credit) and tempo matching
+    (match_tempo).
+
+    Parameters:
+    - clip_id: Exact Suno clip id to place
+    - query: Library search text when clip_id is empty
+    - match_tempo: Set Live's tempo to the analysed bpm
+    - allow_download_credit: Approve spending a download credit if required
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _get_suno_bridge().library_to_live(
+            clip_id=_suno_text(clip_id),
+            query=_suno_text(query),
+            match_tempo=match_tempo,
+            allow_download_credit=allow_download_credit,
+        )
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error placing Suno library song in Live: {str(e)}")
+        return f"Error placing Suno library song in Live: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("suno_cover_clip")
+@trajectory_tool("suno_cover_clip")
+def suno_cover_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    file_path: str,
+    style: str = "",
+    lyrics: str = "",
+    keep_vocals: bool = False,
+    voice_id: str = "",
+    title: str = "",
+    clip_count: int = 1,
+    match_tempo: bool = False,
+    allow_download_credit: bool = False,
+    wait_budget_seconds: int = 600,
+    user_prompt: str = "",
+) -> str:
+    """
+    Cover the audio clip in a Live clip slot with Suno, place the result back.
+
+    The clip slot must hold a clip (checked against Live). file_path
+    is the clip's underlying audio file on disk - the frozen Live
+    wire surface does not expose clip file paths, so the caller
+    supplies it; v1 uploads that file as-is (a warped clip's rendered
+    sound may differ - a rendered bounce is v2). The upload uses
+    Suno's PUT flow, then the cover is created. Suno does NOT carry
+    a source's lyrics into a cover: with keep_vocals and no new
+    lyrics, the uploaded clip's own lyrics are passed explicitly so
+    the vocals survive; with neither, the cover is instrumental
+    unless voice_id is set. Costs Suno credits (usage checked first).
+
+    Parameters:
+    - track_index: Live track holding the source clip
+    - clip_index: Clip slot holding the source clip
+    - file_path: Absolute path to the clip's audio file on disk
+    - style: New style for the cover
+    - lyrics: New lyrics, empty = keep source lyrics when keep_vocals
+    - keep_vocals: Pass the source lyrics explicitly to keep vocals
+    - voice_id: Suno voice id to sing the cover
+    - title: Title for the cover
+    - clip_count: Covers per call, 1 or 2 (default 1)
+    - match_tempo: Set Live's tempo to the analysed bpm of the result
+    - allow_download_credit: Approve spending a download credit if required
+    - wait_budget_seconds: Total seconds to wait per stage
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _get_suno_bridge().cover_clip(
+            track_index=track_index,
+            clip_index=clip_index,
+            file_path=file_path,
+            style=_suno_text(style),
+            lyrics=_suno_text(lyrics),
+            keep_vocals=keep_vocals,
+            voice_id=_suno_text(voice_id),
+            title=_suno_text(title),
+            clip_count=clip_count,
+            match_tempo=match_tempo,
+            allow_download_credit=allow_download_credit,
+            wait_budget_seconds=wait_budget_seconds,
+        )
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error covering clip with Suno: {str(e)}")
+        return f"Error covering clip with Suno: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("suno_extend_clip")
+@trajectory_tool("suno_extend_clip")
+def suno_extend_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    file_path: str,
+    continue_at: float,
+    lyrics: str = "",
+    style: str = "",
+    title: str = "",
+    clip_count: int = 1,
+    match_tempo: bool = False,
+    allow_download_credit: bool = False,
+    wait_budget_seconds: int = 600,
+    user_prompt: str = "",
+) -> str:
+    """
+    Extend the audio clip in a Live clip slot with Suno, place the whole song back.
+
+    Like suno_cover_clip, the slot must hold a clip and file_path is
+    the clip's underlying audio file (v1 uploads it as-is). The
+    extension continues the source from continue_at seconds and
+    contains only the continuation; the bridge joins the chain with
+    Suno's full-song operation (free, idempotent) and places the
+    joined song. Costs Suno credits (usage checked first).
+
+    Parameters:
+    - track_index: Live track holding the source clip
+    - clip_index: Clip slot holding the source clip
+    - file_path: Absolute path to the clip's audio file on disk
+    - continue_at: Seconds into the source clip to continue from
+    - lyrics: Lyrics for the continuation
+    - style: Style tags for the continuation
+    - title: Title for the extended song
+    - clip_count: Extensions per call, 1 or 2 (default 1)
+    - match_tempo: Set Live's tempo to the analysed bpm of the result
+    - allow_download_credit: Approve spending a download credit if required
+    - wait_budget_seconds: Total seconds to wait per stage
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _get_suno_bridge().extend_clip(
+            track_index=track_index,
+            clip_index=clip_index,
+            file_path=file_path,
+            continue_at=continue_at,
+            lyrics=_suno_text(lyrics),
+            style=_suno_text(style),
+            title=_suno_text(title),
+            clip_count=clip_count,
+            match_tempo=match_tempo,
+            allow_download_credit=allow_download_credit,
+            wait_budget_seconds=wait_budget_seconds,
+        )
+        return _dump_tool_result(result)
+    except Exception as e:
+        logger.error(f"Error extending clip with Suno: {str(e)}")
+        return f"Error extending clip with Suno: {str(e)}"
+
+
+
 # Main execution
 def main():
     """Run the MCP server"""
