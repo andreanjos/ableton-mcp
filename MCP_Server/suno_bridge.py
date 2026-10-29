@@ -4,12 +4,15 @@ This module holds the bridge logic with both edges injected:
 
 * a :class:`~MCP_Server.suno_client.SunoClient` (faked in tests with
   a replay of the real tool schemas / response shapes), and
-* a *placer* - the Live edge, with two methods:
+* a *placer* - the Live edge, with three methods:
   ``place_audio_file(path, track_name, tempo_bpm)`` returning the
-  placement record, and ``get_clip_slot(track_index, clip_index)``
-  returning the slot's clip info (or None). The real placer lives in
-  ``MCP_Server.server`` and drives the existing Live connection; the
-  test placer records calls.
+  placement record, ``get_clip_slot(track_index, clip_index)``
+  returning the slot's clip info (or None), and
+  ``get_clip_file_path(track_index, clip_index)`` returning the file
+  path Live itself reports for the slot's clip (or None when Live
+  reports none). The real placer lives in ``MCP_Server.server`` and
+  drives the existing Live connection; the test placer records
+  calls.
 
 Guardrails, as code (design of record:
 hidden_files/ableton-suno-bridge-design-2026-10-29.md):
@@ -34,10 +37,22 @@ hidden_files/ableton-suno-bridge-design-2026-10-29.md):
 * **analysis is best-effort** - a missing/failed timing map never
   blocks a placement; tempo is set in Live only when the caller
   asked for a tempo match AND a bpm was actually measured.
+* **source-file binding (cover/extend)** - before any upload, the
+  caller-supplied ``file_path`` is compared with the path Live
+  itself reports for the addressed slot (via the placer's
+  ``get_clip_file_path``, which reads the existing
+  ``get_session_snapshot`` surface). A positive mismatch refuses
+  the operation before any upload or credit spend; a match is
+  carried in the result as ``source_file_verified: true``; when
+  Live reports no path, the operation proceeds on the has-clip
+  check alone and the result carries
+  ``source_file_verified: false`` so the unchecked binding is
+  visible, never silent.
 """
 
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -122,6 +137,39 @@ def _is_requires_credit(payload=None, error=None):
     if error is not None:
         texts.extend([str(error), str(getattr(error, "code", "") or "")])
     return any("requires_credit" in t for t in texts)
+
+
+def _normalize_path(path):
+    """One normal form for both sides of the source-file binding.
+
+    ``~`` is expanded and the result is made absolute with every
+    symlink, ``.`` and ``..`` component resolved (``os.path.realpath``
+    does all three, lexically for any tail that does not exist).
+    Case is deliberately NOT folded here: whether two differently
+    cased spellings name the same file is a property of the
+    filesystem, so that equivalence is settled by ``os.path.samefile``
+    in :func:`_paths_match` instead of by guessing here.
+    """
+    return os.path.realpath(os.path.expanduser(str(path)))
+
+
+def _paths_match(supplied, reported):
+    """True when two path spellings name the same file.
+
+    Equal after :func:`_normalize_path` (covers ``~``, symlinks and
+    dot components), or the filesystem itself says so via
+    ``os.path.samefile`` when both files exist (covers
+    case-insensitive volumes such as the Mac's default APFS, where
+    the spelling Live reports may differ in case from the caller's).
+    """
+    if _normalize_path(supplied) == _normalize_path(reported):
+        return True
+    try:
+        return os.path.samefile(
+            _normalize_path(supplied), _normalize_path(reported)
+        )
+    except (OSError, ValueError):
+        return False
 
 
 class SunoBridge:
@@ -561,16 +609,67 @@ class SunoBridge:
             )
         return slot
 
+    def _verify_source_file(self, track_index, clip_index, file_path):
+        """Bind the caller-supplied file to the addressed Live clip.
+
+        Asks the placer for the file path Live itself reports for
+        the slot (the real placer reads the existing
+        ``get_session_snapshot`` surface, whose session-clip
+        serializer includes ``file_path`` when the LOM provides
+        one) and compares it with ``file_path``:
+
+        * match -> the binding record carries
+          ``source_file_verified: True``;
+        * positive mismatch (Live names a different absolute file)
+          -> refuse here, before any upload or credit spend, naming
+          both paths;
+        * Live reports no path (or only a relative one, which this
+          process cannot anchor to Live's own view of the disk) ->
+          proceed on the has-clip check, with the record carrying
+          ``source_file_verified: False`` so the unchecked binding
+          is visible in the result rather than silent.
+
+        Both sides are normalised the same way before comparison
+        (:func:`_normalize_path`), and the filesystem arbitrates
+        case and aliasing via :func:`_paths_match`. The record's
+        ``file_path`` is the normalised caller path, which is what
+        the upload then reads - so ``~`` and symlink spellings the
+        caller used work end to end.
+        """
+        getter = getattr(self.placer, "get_clip_file_path", None)
+        reported = getter(track_index, clip_index) if getter else None
+        record = {
+            "source_file_verified": False,
+            "file_path": _normalize_path(file_path),
+            "live_reported_file_path": reported or None,
+        }
+        if not reported:
+            return record
+        if _paths_match(file_path, reported):
+            record["source_file_verified"] = True
+            return record
+        if os.path.isabs(os.path.expanduser(str(reported))):
+            raise SunoBridgeError(
+                "Refusing to upload: file_path %s does not match the "
+                "file Live reports for track %s, slot %s (%s). "
+                "Nothing was uploaded and no credits were spent."
+                % (file_path, track_index, clip_index, reported)
+            )
+        return record
+
     def cover_clip(self, *, track_index, clip_index, file_path,
                    style=None, lyrics=None, keep_vocals=False,
                    voice_id=None, title=None, clip_count=1,
                    match_tempo=False, allow_download_credit=False,
                    wait_budget_seconds=DEFAULT_WAIT_BUDGET_SECONDS):
         slot = self._clip_slot_or_raise(track_index, clip_index)
-        uploaded = self.upload_file(file_path)
+        binding = self._verify_source_file(
+            track_index, clip_index, file_path
+        )
+        uploaded = self.upload_file(binding["file_path"])
         if uploaded.get("status") != "complete":
             return {"status": uploaded.get("status", "pending"),
-                    "uploaded": uploaded}
+                    "uploaded": uploaded, **binding}
         source_id = uploaded.get("id") or uploaded.get("clip_id")
         # Cover lyrics rule (design): Suno does NOT carry the
         # source's lyrics over - omitted lyrics make the cover
@@ -594,12 +693,14 @@ class SunoBridge:
             "cover", {"source": source_id, **params}
         )
         created = self.client.audio_covers_create(source_id, **params)
-        return self._place_created(
+        result = self._place_created(
             created, wait_budget_seconds,
             source="cover", match_tempo=match_tempo,
             allow_download_credit=allow_download_credit,
             title=title,
         )
+        result.update(binding)
+        return result
 
     def extend_clip(self, *, track_index, clip_index, file_path,
                     continue_at, lyrics=None, style=None,
@@ -608,10 +709,13 @@ class SunoBridge:
                     allow_download_credit=False,
                     wait_budget_seconds=DEFAULT_WAIT_BUDGET_SECONDS):
         slot = self._clip_slot_or_raise(track_index, clip_index)
-        uploaded = self.upload_file(file_path)
+        binding = self._verify_source_file(
+            track_index, clip_index, file_path
+        )
+        uploaded = self.upload_file(binding["file_path"])
         if uploaded.get("status") != "complete":
             return {"status": uploaded.get("status", "pending"),
-                    "uploaded": uploaded}
+                    "uploaded": uploaded, **binding}
         source_id = uploaded.get("id") or uploaded.get("clip_id")
         self._guard_credits(clip_count)
         params = {
@@ -634,6 +738,7 @@ class SunoBridge:
             extra={"created": created},
         )
         if waited["status"] != "complete":
+            waited.update(binding)
             return waited
         clip_id = waited["clip_ids"][0]
         if join_full_song:
@@ -652,13 +757,16 @@ class SunoBridge:
                     extra={"created": joined},
                 )
                 if joined_wait["status"] != "complete":
+                    joined_wait.update(binding)
                     return joined_wait
                 clip_id = joined_ids[0]
-        return self._finish_to_live(
+        result = self._finish_to_live(
             clip_id, title=title, source="extend",
             match_tempo=match_tempo,
             allow_download_credit=allow_download_credit,
         )
+        result.update(binding)
+        return result
 
     def _place_created(self, created, wait_budget_seconds, *, source,
                        match_tempo, allow_download_credit, title):

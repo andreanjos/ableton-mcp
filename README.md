@@ -675,8 +675,14 @@ Placement details: downloads land in `~/Downloads/AbletonMCP-Suno`
 analysis (bpm/key/beats) is read best-effort - it never blocks a
 placement, and Live's tempo is set only when `match_tempo=True`
 **and** an analysis bpm was actually measured. Cover/extend take the
-clip's file path as a parameter: the Live wire surface does not
-expose clip file paths, and v1 uploads the file as it exists on disk
+clip's file path as a parameter: `get_track_info` cannot report it
+(its clip entries carry name/length/state only), but
+`get_session_snapshot` can - before any upload, the bridge compares
+the supplied path against the path Live reports for the addressed
+slot through that snapshot, refuses on a positive mismatch, and
+marks the result `source_file_verified` (`false` when Live reported
+no path, so the binding could not be checked). v1 uploads the file
+as it exists on disk
 (a warped/edited clip's rendered sound may differ; a rendered
 bounce is future work). Suno downloads are full mixes - the official
 server offers no stems or MIDI extraction.

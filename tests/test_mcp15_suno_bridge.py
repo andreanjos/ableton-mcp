@@ -680,9 +680,12 @@ class FakeSuno:
 
 
 class FakePlacer:
-    def __init__(self, has_clip=True):
+    def __init__(self, has_clip=True, reported_file_path=None):
         self.placements = []
         self.has_clip = has_clip
+        # What Live reports for the slot through the snapshot
+        # surface; None means Live reported no path.
+        self.reported_file_path = reported_file_path
 
     def place_audio_file(self, path, track_name, tempo_bpm=None):
         self.placements.append({
@@ -701,6 +704,9 @@ class FakePlacer:
             return {"has_clip": False, "clip": None}
         return {"has_clip": True,
                 "clip": {"name": "Source Loop", "length": 8.0}}
+
+    def get_clip_file_path(self, track_index, clip_index):
+        return self.reported_file_path
 
 
 def make_bridge(tmp_path, suno=None, placer=None, clock=None):
@@ -975,6 +981,143 @@ def test_extend_clip_joins_full_song_and_places(tmp_path):
     assert joined and joined[0][1][0] == "ext-1"
 
 
+# -------------------------------------------- source-file binding
+# F1 (MCP-15 review): the caller-supplied file_path is verified
+# against the path Live reports for the addressed slot through
+# get_session_snapshot BEFORE any upload - a mismatch must make
+# the review's wrong-file scenario (silent upload of unrelated
+# bytes, credits spent, result placed) impossible.
+
+
+def test_cover_clip_verified_when_live_reports_same_file(tmp_path):
+    suno = FakeSuno()
+    source_file = tmp_path / "loop.wav"
+    source_file.write_bytes(b"LOOP-BYTES")
+    placer = FakePlacer(reported_file_path=str(source_file))
+    bridge = make_bridge(tmp_path, suno, placer)
+    result = bridge.cover_clip(
+        track_index=0, clip_index=0, file_path=str(source_file),
+        style="techno",
+    )
+    assert result["status"] == "placed"
+    assert result["source_file_verified"] is True
+    assert result["live_reported_file_path"] == str(source_file)
+
+
+def test_cover_clip_mismatch_refused_before_any_upload(tmp_path):
+    suno = FakeSuno()
+    precious = tmp_path / "precious.wav"
+    precious.write_bytes(b"PRECIOUS")
+    unrelated = tmp_path / "unrelated.wav"
+    unrelated.write_bytes(b"UNRELATED")
+    placer = FakePlacer(reported_file_path=str(precious))
+    bridge = make_bridge(tmp_path, suno, placer)
+    with pytest.raises(SunoBridgeError, match="does not match"):
+        bridge.cover_clip(
+            track_index=0, clip_index=0, file_path=str(unrelated),
+            style="techno",
+        )
+    # Nothing reached Suno at all: no upload session, no bytes, no
+    # cover creation, not even the credits-guard read.
+    assert suno.calls == []
+    assert placer.placements == []
+
+
+def test_cover_clip_unreported_path_marks_unverified(tmp_path):
+    suno = FakeSuno()
+    source_file = tmp_path / "loop.wav"
+    source_file.write_bytes(b"LOOP-BYTES")
+    placer = FakePlacer(reported_file_path=None)
+    bridge = make_bridge(tmp_path, suno, placer)
+    result = bridge.cover_clip(
+        track_index=0, clip_index=0, file_path=str(source_file),
+        style="techno",
+    )
+    assert result["status"] == "placed"
+    assert result["source_file_verified"] is False
+    assert result["live_reported_file_path"] is None
+
+
+def test_cover_clip_symlink_spelling_still_verifies(tmp_path):
+    suno = FakeSuno()
+    real_file = tmp_path / "real loop.wav"
+    real_file.write_bytes(b"LOOP-BYTES")
+    link = tmp_path / "alias.wav"
+    link.symlink_to(real_file)
+    placer = FakePlacer(reported_file_path=str(real_file))
+    bridge = make_bridge(tmp_path, suno, placer)
+    result = bridge.cover_clip(
+        track_index=0, clip_index=0, file_path=str(link),
+        style="techno",
+    )
+    assert result["source_file_verified"] is True
+    put = suno.calls_of("put_bytes")[0]
+    assert put[1][1] == b"LOOP-BYTES"
+
+
+def test_cover_clip_tilde_spelling_verifies_and_uploads(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    suno = FakeSuno()
+    source_file = tmp_path / "loop.wav"
+    source_file.write_bytes(b"LOOP-BYTES")
+    placer = FakePlacer(reported_file_path=str(source_file))
+    bridge = make_bridge(tmp_path, suno, placer)
+    result = bridge.cover_clip(
+        track_index=0, clip_index=0, file_path="~/loop.wav",
+        style="techno",
+    )
+    assert result["source_file_verified"] is True
+    put = suno.calls_of("put_bytes")[0]
+    assert put[1][1] == b"LOOP-BYTES"
+
+
+def test_extend_clip_verified_when_live_reports_same_file(tmp_path):
+    suno = FakeSuno()
+    source_file = tmp_path / "loop.wav"
+    source_file.write_bytes(b"LOOP-BYTES")
+    placer = FakePlacer(reported_file_path=str(source_file))
+    bridge = make_bridge(tmp_path, suno, placer)
+    result = bridge.extend_clip(
+        track_index=1, clip_index=2, file_path=str(source_file),
+        continue_at=12.5,
+    )
+    assert result["status"] == "placed"
+    assert result["source_file_verified"] is True
+
+
+def test_extend_clip_mismatch_refused_before_any_upload(tmp_path):
+    suno = FakeSuno()
+    precious = tmp_path / "precious.wav"
+    precious.write_bytes(b"PRECIOUS")
+    unrelated = tmp_path / "unrelated.wav"
+    unrelated.write_bytes(b"UNRELATED")
+    placer = FakePlacer(reported_file_path=str(precious))
+    bridge = make_bridge(tmp_path, suno, placer)
+    with pytest.raises(SunoBridgeError, match="does not match"):
+        bridge.extend_clip(
+            track_index=1, clip_index=2, file_path=str(unrelated),
+            continue_at=12.5,
+        )
+    assert suno.calls == []
+    assert placer.placements == []
+
+
+def test_extend_clip_unreported_path_marks_unverified(tmp_path):
+    suno = FakeSuno()
+    source_file = tmp_path / "loop.wav"
+    source_file.write_bytes(b"LOOP-BYTES")
+    placer = FakePlacer(reported_file_path=None)
+    bridge = make_bridge(tmp_path, suno, placer)
+    result = bridge.extend_clip(
+        track_index=1, clip_index=2, file_path=str(source_file),
+        continue_at=12.5,
+    )
+    assert result["status"] == "placed"
+    assert result["source_file_verified"] is False
+    assert result["live_reported_file_path"] is None
+
+
 def test_upload_missing_file_refused(tmp_path):
     bridge = make_bridge(tmp_path)
     with pytest.raises(SunoBridgeError):
@@ -1042,15 +1185,27 @@ def test_suno_generate_tool_converts_empty_strings(stub_bridge):
 class FakeConn:
     """send_command stub in the MCP-04 pattern."""
 
-    def __init__(self, placed=True):
+    def __init__(self, placed=True, snapshot_file_path="/music/loop.wav"):
         self.calls = []
         self.placed = placed
+        self.snapshot_file_path = snapshot_file_path
 
     def send_command(self, command_type, params=None, **kwargs):
         self.calls.append((command_type, params))
         if command_type == "get_session_info":
             return {"tempo": 120.0, "track_count": 3,
                     "tracks": [{}, {}, {}]}
+        if command_type == "get_session_snapshot":
+            clip = {"name": "Neon", "length": 16.0}
+            if self.snapshot_file_path is not None:
+                clip["file_path"] = self.snapshot_file_path
+            return {"tracks": [{
+                "index": 0,
+                "clip_slots": [
+                    {"index": 0, "has_clip": True, "clip": clip},
+                    {"index": 1, "has_clip": False, "clip": None},
+                ],
+            }]}
         if command_type == "create_audio_track":
             return {"name": "4-Audio"}  # note: no index, on purpose
         if command_type == "create_audio_clip":
@@ -1106,3 +1261,23 @@ def test_placer_get_clip_slot():
     assert slot["has_clip"] is True
     assert slot["clip"]["name"] == "Neon"
     assert placer.get_clip_slot(0, 9) is None
+
+
+def test_placer_get_clip_file_path_reads_snapshot():
+    conn = FakeConn()
+    placer = server_module._SunoLivePlacer(lambda: conn)
+    assert placer.get_clip_file_path(0, 0) == "/music/loop.wav"
+    # The read went through get_session_snapshot, projected to the
+    # one track - the frozen surface, no new wire command.
+    name, params = conn.calls[-1]
+    assert name == "get_session_snapshot"
+    assert params["track_indices"] == [0]
+    # An empty slot and an unknown track report no path.
+    assert placer.get_clip_file_path(0, 1) is None
+    assert placer.get_clip_file_path(9, 0) is None
+
+
+def test_placer_get_clip_file_path_none_when_live_reports_none():
+    conn = FakeConn(snapshot_file_path=None)
+    placer = server_module._SunoLivePlacer(lambda: conn)
+    assert placer.get_clip_file_path(0, 0) is None

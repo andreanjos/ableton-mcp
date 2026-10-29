@@ -2374,6 +2374,41 @@ class _SunoLivePlacer:
                 }
         return None
 
+    def get_clip_file_path(self, track_index: int, clip_index: int):
+        """The file path Live itself reports for a clip slot's clip.
+
+        ``get_track_info`` cannot provide this (its clip entries
+        carry name/length/state only), but the existing
+        ``get_session_snapshot`` command can: its per-slot
+        serializer (``_serialize_session_clip`` ->
+        ``_serialize_clip_common`` in the Remote Script) includes
+        ``file_path`` when the LOM provides one. Returns that path,
+        or None when Live reports no path for the slot - callers
+        must treat None as "unverifiable", never as a match.
+        """
+        result = self._conn().send_command(
+            "get_session_snapshot",
+            {
+                "track_indices": [track_index],
+                "include_notes": False,
+                "include_params": False,
+                "include_scenes": False,
+                "include_return_tracks": False,
+                "include_master_track": False,
+                "include_cue_points": False,
+                "include_devices": False,
+                "include_arrangement_clips": False,
+            },
+        )
+        for track in result.get("tracks") or []:
+            if track.get("index") != track_index:
+                continue
+            for slot in track.get("clip_slots") or []:
+                if slot.get("index") == clip_index:
+                    clip = slot.get("clip") or {}
+                    return clip.get("file_path")
+        return None
+
     def place_audio_file(self, path: str, track_name: str,
                          tempo_bpm: float = None) -> dict:
         conn = self._conn()
@@ -2670,15 +2705,22 @@ def suno_cover_clip(
     Cover the audio clip in a Live clip slot with Suno, place the result back.
 
     The clip slot must hold a clip (checked against Live). file_path
-    is the clip's underlying audio file on disk - the frozen Live
-    wire surface does not expose clip file paths, so the caller
-    supplies it; v1 uploads that file as-is (a warped clip's rendered
-    sound may differ - a rendered bounce is v2). The upload uses
-    Suno's PUT flow, then the cover is created. Suno does NOT carry
+    is the clip's underlying audio file on disk, supplied by the
+    caller: get_track_info cannot report it (its clip entries carry
+    name/length/state only), but get_session_snapshot can and does -
+    before any upload, the bridge compares file_path against the
+    path Live reports for this slot through that snapshot, refuses
+    on a positive mismatch, and marks the result
+    source_file_verified (false when Live reported no path, so the
+    binding could not be checked). v1 uploads that file as-is (a
+    warped clip's rendered sound may differ - a rendered bounce is
+    v2). The upload uses Suno's PUT flow; the credits guard runs
+    after the upload, before the cover is created (the upload itself
+    spends no generation credits). Suno does NOT carry
     a source's lyrics into a cover: with keep_vocals and no new
     lyrics, the uploaded clip's own lyrics are passed explicitly so
     the vocals survive; with neither, the cover is instrumental
-    unless voice_id is set. Costs Suno credits (usage checked first).
+    unless voice_id is set. Costs Suno credits.
 
     Parameters:
     - track_index: Live track holding the source clip
@@ -2737,12 +2779,18 @@ def suno_extend_clip(
     """
     Extend the audio clip in a Live clip slot with Suno, place the whole song back.
 
-    Like suno_cover_clip, the slot must hold a clip and file_path is
-    the clip's underlying audio file (v1 uploads it as-is). The
+    Like suno_cover_clip, the slot must hold a clip, file_path is
+    the clip's underlying audio file (v1 uploads it as-is), and the
+    same source-file verification runs before any upload: the
+    supplied path is compared against the path Live reports for
+    this slot via get_session_snapshot (get_track_info cannot
+    report it), a positive mismatch refuses, and the result carries
+    source_file_verified. The credits guard runs after the upload,
+    before the extension is created. The
     extension continues the source from continue_at seconds and
     contains only the continuation; the bridge joins the chain with
     Suno's full-song operation (free, idempotent) and places the
-    joined song. Costs Suno credits (usage checked first).
+    joined song. Costs Suno credits.
 
     Parameters:
     - track_index: Live track holding the source clip
