@@ -620,6 +620,73 @@ event-queue scenario and a timeout-budget scenario replaying
 simulated response gaps against the per-command budgets. Add
 `--json` for machine-readable output.
 
+### Suno bridge (MCP-15)
+
+Six `suno_*` tools connect the session to Suno's official MCP server
+(`https://api.suno.com/mcp`) - the code talks to Suno directly, with
+its own OAuth grant; nothing routes through any other client's
+connection.
+
+**One-time sign-in (per user, interactive):**
+
+```bash
+ableton-mcp-suno-auth            # or: uv run python -m MCP_Server.suno_auth
+```
+
+This registers the fork's own OAuth client with Suno (dynamic client
+registration, authorization-code + PKCE S256, no client secret),
+opens the browser for Suno approval, serves the localhost callback,
+and stores the refresh token in the macOS login Keychain (service
+`ableton-mcp-suno`). Options: `--port` for the callback port,
+`--no-browser` to print the authorize URL instead, and
+`--token-file PATH` for a development file store instead of the
+Keychain. Until this is run once, the `suno_*` tools answer with a
+sign-in error and nothing else.
+
+**Tools:**
+
+- `suno_status` - account + usage (plan, credits, models). Read-only.
+- `suno_generate` - generate (Simple description mode or Custom
+  lyrics/style mode) and wait for completion. No Live placement.
+- `suno_generate_to_live` - generate, download the WAV, place it on
+  a new audio track named `<title> [suno:<clip_id>]`, verified by
+  read-back, with a `.suno.json` sidecar next to the download.
+- `suno_library_to_live` - place an existing library song (by clip
+  id or search query). No generation cost.
+- `suno_cover_clip` / `suno_extend_clip` - upload a Live clip's
+  underlying file (PUT flow) and cover or extend it on Suno, then
+  place the result back (extend joins the full song first).
+
+Guardrails, enforced in code (`MCP_Server/suno_bridge.py`): account
+usage is checked before any generation and a call is refused when
+the remaining credits cannot cover it; `clip_count` is always sent
+explicitly (Suno defaults an MCP sign-in caller to **2** - unpinned
+generations cost double); `duration_strict` is explicit whenever a
+duration is given; every creation carries a derived idempotency key
+so retries replay instead of double-spending; downloads are first
+requested **without** credit confirmation - if Suno answers
+`requires_credit`, the tool stops and reports it, and only a call
+with `allow_download_credit=True` spends the credit. Waits run in a
+bounded budget and report `pending` honestly rather than claiming
+completion.
+
+Placement details: downloads land in `~/Downloads/AbletonMCP-Suno`
+(override with `ABLETON_MCP_SUNO_DOWNLOAD_DIR`). Suno's audio
+analysis (bpm/key/beats) is read best-effort - it never blocks a
+placement, and Live's tempo is set only when `match_tempo=True`
+**and** an analysis bpm was actually measured. Cover/extend take the
+clip's file path as a parameter: `get_track_info` cannot report it
+(its clip entries carry name/length/state only), but
+`get_session_snapshot` can - before any upload, the bridge compares
+the supplied path against the path Live reports for the addressed
+slot through that snapshot, refuses on a positive mismatch, and
+marks the result `source_file_verified` (`false` when Live reported
+no path, so the binding could not be checked). v1 uploads the file
+as it exists on disk
+(a warped/edited clip's rendered sound may differ; a rendered
+bounce is future work). Suno downloads are full mixes - the official
+server offers no stems or MIDI extraction.
+
 ## Limitations & Security Considerations
 
 - Creating complex musical arrangements might need to be broken down into smaller steps
